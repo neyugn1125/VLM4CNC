@@ -1,0 +1,7 @@
+# Rules for Cursor and other AI Coding Agents
+
+Please strictly read and follow the project guidelines defined in [AGENTS.md](AGENTS.md):
+
+1. **PLAN FIRST**: NEVER write, edit, or delete code without first presenting a detailed Implementation Plan (as an interactive plan/artifact in chat, do NOT save plan files to repository). Wait for user confirmation before coding.
+2. **CHANGELOG REQUIRED**: All code changes MUST be recorded in [CHANGELOG.md](CHANGELOG.md) with details on affected files, change summary (Added/Changed/Fixed/Removed), and notes for subsequent agents.
+

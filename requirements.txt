@@ -1,0 +1,28 @@
+# GUI Framework
+PySide6>=6.7.0
+
+# CAD & Computational Geometry
+ezdxf>=1.3.0
+shapely>=2.0.0
+
+# Model Context Protocol (MCP) Server
+mcp>=1.2.0,<2.0.0
+
+# Structured Output & Data Modeling
+pydantic>=2.9.0
+instructor>=1.6.0
+
+# AI / VLM Providers
+openai>=1.50.0
+google-genai>=1.0.0
+
+# Image Processing & HTTP
+pillow>=10.0.0
+httpx>=0.28.0
+
+# Environment Management & Testing
+python-dotenv>=1.0.1
+pytest>=8.3.0
+
+# Packaging & Deployment
+pyinstaller>=6.0.0
