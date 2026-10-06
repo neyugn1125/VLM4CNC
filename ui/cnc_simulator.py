@@ -1,15 +1,18 @@
 """
 CNC Toolpath Simulator Module for VLM4CNC.
-Provides an interactive 2D CNC toolpath visualizer inspired by tools like MechSimulator.
+Provides an interactive 2D CNC toolpath visualizer inspired by CAD/CAM software and ImageToGCode.
 Features:
-  - G-Code motion parser (G00, G01, G02, G03, G81, G83, S, F, Z).
-  - High-performance QPainter interactive 2D canvas with pan, zoom, grid, and stock bounds.
-  - Rapid moves (G00 dashed orange/red), cutting moves (G01 solid blue with tool cut band).
+  - G-Code physical motion parser (G00, G01, G02, G03, G81, G83, S, F, Z).
+  - High-performance QPainter interactive 2D canvas with pan, zoom, dynamic adaptive grid, and stock bounds.
+  - Rapid moves (G00 dashed grey), cutting moves (G01 solid green with tool cut band), Arcs (G02/G03).
+  - Direction Chevrons: subtle arrows along path moves showing cutting direction.
+  - Traveled Path Highlight: clear visual progress trail of already cut paths.
   - Canned drilling cycles (G81/G83) with hole position and diameter markers.
-  - Animated cutter with tool diameter Ø and crosshair cursor.
-  - Playback controls: Run, Pause, Step, Reset, Speed slider (1x - 10x), Scrubber slider.
-  - Real-time Digital Readout (DRO): Current X, Y, Z, Feedrate, Spindle RPM, active G-code block.
-  - Toolpath statistics: Cut distance, Rapid distance, Total moves, Estimated cycle time.
+  - Animated transparent cutter with tool diameter Ø and precision crosshair cursor.
+  - Playback controls: Run/Pause, Step Forward, Step Backward, Reset, Speed slider (1x - 10x), Scrubber slider.
+  - Real-time Digital Readout (DRO): Current X, Y, Z, Feedrate, Spindle RPM, Motion mode, active G-code block.
+  - Toolpath statistics & Envelope: Width x Height mm, Cut distance, Rapid distance, Total moves, Estimated cycle time.
+  - View toggles: Grid, Rapids, Direction Arrows, Tool Band, Traveled Trail.
 """
 
 from dataclasses import dataclass, field
@@ -43,6 +46,22 @@ from PySide6.QtWidgets import (
 )
 
 
+# CAD Simulation Palette inspired by ImageToGCode and industrial CAM viewers
+SIM_CANVAS_BG = QColor(255, 255, 255)
+SIM_GRID_COLOR = QColor(233, 236, 239)
+SIM_AXIS_X_COLOR = QColor(234, 67, 53)
+SIM_AXIS_Y_COLOR = QColor(52, 168, 83)
+SIM_RAPID_COLOR = QColor(154, 160, 166)
+SIM_LINEAR_COLOR = QColor(30, 142, 62)
+SIM_ARC_CW_COLOR = QColor(26, 115, 232)
+SIM_ARC_CCW_COLOR = QColor(227, 116, 0)
+SIM_TRAVELED_COLOR = QColor(255, 140, 0)
+SIM_TOOL_OUTLINE = QColor(230, 81, 0)
+SIM_TOOL_FILL = QColor(255, 243, 224, 175)
+SIM_TOOL_CENTER = QColor(32, 33, 36)
+RAPID_DISPLAY_FEED = 3000.0  # mm/min display speed for rapid G00 moves
+
+
 @dataclass
 class ToolpathSegment:
     """Represents a single parsed motion command in a G-Code program."""
@@ -57,13 +76,27 @@ class ToolpathSegment:
     is_cutting: bool = False
     drill_depth: float = 0.0
     hole_diameter: float = 3.0
+    time_start: float = 0.0
+    time_end: float = 0.0
+    duration: float = 0.0
+    # Arc metadata for G02/G03
+    is_arc: bool = False
+    arc_center: Optional[Tuple[float, float]] = None
+    arc_radius: float = 0.0
+    arc_clockwise: bool = True
+    arc_start_angle: float = 0.0
+    arc_sweep_angle: float = 0.0
 
     def __post_init__(self):
-        # Calculate 3D euclidean distance
-        dx = self.end[0] - self.start[0]
-        dy = self.end[1] - self.start[1]
         dz = self.end[2] - self.start[2]
-        self.length = math.sqrt(dx * dx + dy * dy + dz * dz)
+        if self.is_arc and self.arc_radius > 1e-4:
+            arc_dist = self.arc_radius * abs(self.arc_sweep_angle)
+            self.length = math.sqrt(arc_dist * arc_dist + dz * dz)
+        else:
+            dx = self.end[0] - self.start[0]
+            dy = self.end[1] - self.start[1]
+            self.length = math.sqrt(dx * dx + dy * dy + dz * dz)
+
         # Cutting if G01/G02/G03/G81/G83 and moving at or below Z <= 0
         if self.motion_type in ("G01", "G02", "G03"):
             self.is_cutting = (self.start[2] <= 0.0 or self.end[2] <= 0.0)
@@ -74,7 +107,7 @@ class ToolpathSegment:
 
 
 class GCodeToolpathParser:
-    """Parses standard ISO G-Code into a list of ToolpathSegments for visualization."""
+    """Parses standard ISO G-Code into sequential motion segments with physical timeline."""
 
     def __init__(self):
         self.segments: List[ToolpathSegment] = []
@@ -83,9 +116,11 @@ class GCodeToolpathParser:
         self.est_time_seconds: float = 0.0
         self.bbox_min: Tuple[float, float] = (0.0, 0.0)
         self.bbox_max: Tuple[float, float] = (100.0, 100.0)
+        self.envelope_width: float = 100.0
+        self.envelope_height: float = 100.0
 
     def parse(self, gcode_text: str, default_tool_dia: float = 3.0) -> List[ToolpathSegment]:
-        """Parse G-Code text into sequential motion segments."""
+        """Parse G-Code text into sequential motion segments with physical feedrate timing."""
         self.segments = []
         self.total_cut_dist = 0.0
         self.total_rapid_dist = 0.0
@@ -98,9 +133,11 @@ class GCodeToolpathParser:
         current_spindle = 1500
         current_motion = "G00"
         tool_diameter = default_tool_dia
+        current_time = 0.0
 
         min_x, min_y = 0.0, 0.0
         max_x, max_y = 100.0, 100.0
+        first_motion = True
 
         lines = gcode_text.splitlines()
         for idx, line in enumerate(lines, start=1):
@@ -116,7 +153,7 @@ class GCodeToolpathParser:
                 except ValueError:
                     pass
 
-            # Strip comments for code token parsing: "(...)" or ";..."
+            # Strip comments for code token parsing
             clean_code = re.sub(r"\(.*?\)", "", raw_line)
             clean_code = re.sub(r";.*$", "", clean_code).strip()
             if not clean_code:
@@ -159,7 +196,13 @@ class GCodeToolpathParser:
             target_y = float(y_match.group(1)) if y_match else current_y
             target_z = float(z_match.group(1)) if z_match else current_z
 
-            has_motion = (x_match or y_match or z_match)
+            # Arc parameters extraction
+            i_match = re.search(r"\bI(-?[0-9.]+)\b", clean_code, re.IGNORECASE)
+            j_match = re.search(r"\bJ(-?[0-9.]+)\b", clean_code, re.IGNORECASE)
+            r_match = re.search(r"\bR(-?[0-9.]+)\b", clean_code, re.IGNORECASE)
+
+            has_arc_params = bool(i_match or j_match or r_match)
+            has_motion = (x_match or y_match or z_match or (has_arc_params and current_motion in ("G02", "G03")))
 
             if has_motion:
                 start_pt = (current_x, current_y, current_z)
@@ -168,6 +211,78 @@ class GCodeToolpathParser:
                 drill_depth = 0.0
                 if current_motion in ("G81", "G83") and z_match:
                     drill_depth = abs(target_z)
+
+                # Arc geometry calculation for G02/G03
+                is_arc = False
+                cx, cy = 0.0, 0.0
+                radius = 0.0
+                is_cw = (current_motion == "G02")
+                theta_start = 0.0
+                sweep_angle = 0.0
+
+                if current_motion in ("G02", "G03"):
+                    if i_match or j_match:
+                        i_val = float(i_match.group(1)) if i_match else 0.0
+                        j_val = float(j_match.group(1)) if j_match else 0.0
+                        cx = current_x + i_val
+                        cy = current_y + j_val
+                        radius = math.hypot(i_val, j_val)
+                        is_arc = (radius > 1e-4)
+                    elif r_match:
+                        r_val = float(r_match.group(1))
+                        radius = abs(r_val)
+                        chord_dx = target_x - current_x
+                        chord_dy = target_y - current_y
+                        chord_len = math.hypot(chord_dx, chord_dy)
+                        if chord_len > 1e-6 and radius >= chord_len / 2.0:
+                            h = math.sqrt(max(0.0, radius * radius - (chord_len / 2.0) ** 2))
+                            mx = (current_x + target_x) / 2.0
+                            my = (current_y + target_y) / 2.0
+                            nx = -chord_dy / chord_len
+                            ny = chord_dx / chord_len
+                            sign = 1.0 if (is_cw if r_val > 0 else not is_cw) else -1.0
+                            cx = mx + sign * h * nx
+                            cy = my + sign * h * ny
+                            is_arc = True
+                        elif chord_len > 1e-6:
+                            cx = (current_x + target_x) / 2.0
+                            cy = (current_y + target_y) / 2.0
+                            radius = chord_len / 2.0
+                            is_arc = True
+
+                    if is_arc and radius > 1e-4:
+                        theta_start = math.atan2(current_y - cy, current_x - cx)
+                        theta_end = math.atan2(target_y - cy, target_x - cx)
+                        is_full_circle = (math.hypot(target_x - current_x, target_y - current_y) < 1e-4)
+                        if is_full_circle:
+                            sweep_angle = -2.0 * math.pi if is_cw else 2.0 * math.pi
+                        else:
+                            diff = theta_end - theta_start
+                            if is_cw:
+                                while diff >= 0.0:
+                                    diff -= 2.0 * math.pi
+                                sweep_angle = diff
+                            else:
+                                while diff <= 0.0:
+                                    diff += 2.0 * math.pi
+                                sweep_angle = diff
+                    else:
+                        is_arc = False
+
+                # Physical move duration based on feedrate
+                eff_feed = current_feed if current_feed > 0 else 300.0
+                speed_feed = RAPID_DISPLAY_FEED if current_motion == "G00" else eff_feed
+                dz = target_z - current_z
+                if is_arc:
+                    arc_dist = radius * abs(sweep_angle)
+                    dist_3d = math.sqrt(arc_dist * arc_dist + dz * dz)
+                else:
+                    dist_3d = math.sqrt(
+                        (target_x - current_x) ** 2 +
+                        (target_y - current_y) ** 2 +
+                        dz ** 2
+                    )
+                duration = (dist_3d / speed_feed) * 60.0 if speed_feed > 0 else 0.0
 
                 seg = ToolpathSegment(
                     motion_type=current_motion,
@@ -179,42 +294,64 @@ class GCodeToolpathParser:
                     raw_text=raw_line,
                     drill_depth=drill_depth,
                     hole_diameter=tool_diameter,
+                    time_start=current_time,
+                    time_end=current_time + duration,
+                    duration=duration,
+                    is_arc=is_arc,
+                    arc_center=(cx, cy) if is_arc else None,
+                    arc_radius=radius if is_arc else 0.0,
+                    arc_clockwise=is_cw if is_arc else True,
+                    arc_start_angle=theta_start if is_arc else 0.0,
+                    arc_sweep_angle=sweep_angle if is_arc else 0.0,
                 )
+                current_time += duration
                 self.segments.append(seg)
 
                 # Accumulate statistics
                 if seg.motion_type == "G00":
                     self.total_rapid_dist += seg.length
-                    # Rapid move estimated at 3000 mm/min
-                    self.est_time_seconds += (seg.length / 3000.0) * 60.0
                 else:
                     self.total_cut_dist += seg.length
-                    feed = current_feed if current_feed > 0 else 300.0
-                    self.est_time_seconds += (seg.length / feed) * 60.0
 
-                min_x = min(min_x, target_x)
-                min_y = min(min_y, target_y)
-                max_x = max(max_x, target_x)
-                max_y = max(max_y, target_y)
+                pts_to_bound = [(target_x, target_y)]
+                if is_arc:
+                    for s_frac in (0.25, 0.5, 0.75):
+                        ang = theta_start + sweep_angle * s_frac
+                        pts_to_bound.append((cx + radius * math.cos(ang), cy + radius * math.sin(ang)))
+
+                for bx, by in pts_to_bound:
+                    if first_motion:
+                        min_x, max_x = bx, bx
+                        min_y, max_y = by, by
+                        first_motion = False
+                    else:
+                        min_x = min(min_x, bx)
+                        min_y = min(min_y, by)
+                        max_x = max(max_x, bx)
+                        max_y = max(max_y, by)
 
                 current_x = target_x
                 current_y = target_y
                 current_z = target_z
 
+        self.est_time_seconds = current_time
         self.bbox_min = (min_x, min_y)
         self.bbox_max = (max_x, max_y)
+        self.envelope_width = max(0.0, max_x - min_x)
+        self.envelope_height = max(0.0, max_y - min_y)
         return self.segments
 
 
 class ToolpathCanvasWidget(QWidget):
     """
     High-performance 2D QPainter canvas that visualizes stock boundary,
-    coordinate axes, grid, G00/G01/G83 paths, and animated cutter cursor.
+    coordinate axes, dynamic adaptive grid, G00/G01/G83 paths, direction arrows,
+    traveled progress trail, and animated cutter cursor.
     """
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
-        self.setMinimumSize(400, 300)
+        self.setMinimumSize(200, 150)
         self.setStyleSheet("background-color: #ffffff; border: 1px solid #1a1a1a;")
 
         # Workpiece and simulation data
@@ -224,7 +361,14 @@ class ToolpathCanvasWidget(QWidget):
         self.segments: List[ToolpathSegment] = []
         self.current_segment_idx: int = 0
         self.tool_pos: Tuple[float, float, float] = (0.0, 0.0, 50.0)
+
+        # View toggles
+        self.show_grid: bool = True
+        self.show_rapids: bool = True
+        self.show_arrows: bool = True
         self.show_tool_band: bool = True
+        self.show_traveled: bool = True
+        self.show_cutter: bool = True
 
         # Viewport navigation (pan and zoom)
         self.scale: float = 3.0  # pixels per mm
@@ -342,24 +486,63 @@ class ToolpathCanvasWidget(QWidget):
         self._draw_tool_cutter(painter)
 
     def _draw_grid(self, painter: QPainter):
-        """Draw technical coordinate millimeter grid."""
+        """Draw dynamic adaptive millimeter grid with numerical labels."""
+        if not self.show_grid or self.scale <= 1e-4:
+            return
+
         painter.save()
-        grid_pen = QPen(QColor(235, 235, 235), 1, Qt.PenStyle.SolidLine)
+        w = self.width()
+        h = self.height()
+
+        target_px = 60.0
+        raw_step = target_px / self.scale
+        steps = [0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0]
+        grid_step = steps[-1]
+        for s in steps:
+            if s >= raw_step:
+                grid_step = s
+                break
+
+        # Bounds in CNC space
+        cnc_min_x = (0.0 - self.pan_x) / self.scale
+        cnc_max_x = (float(w) - self.pan_x) / self.scale
+        cnc_min_y = (self.height() - self.pan_y - float(h)) / self.scale
+        cnc_max_y = (self.height() - self.pan_y - 0.0) / self.scale
+
+        start_x_idx = math.floor(min(cnc_min_x, cnc_max_x) / grid_step)
+        end_x_idx = math.ceil(max(cnc_min_x, cnc_max_x) / grid_step)
+        start_y_idx = math.floor(min(cnc_min_y, cnc_max_y) / grid_step)
+        end_y_idx = math.ceil(max(cnc_min_y, cnc_max_y) / grid_step)
+
+        grid_pen = QPen(SIM_GRID_COLOR, 1, Qt.PenStyle.SolidLine)
         painter.setPen(grid_pen)
+        painter.setFont(QFont("Monospace", 8))
 
-        step_mm = 10.0 if self.scale > 2.0 else 50.0
-        max_extent = max(self.stock_width, self.stock_height) * 2.0
+        # Vertical grid lines
+        for i in range(start_x_idx, end_x_idx + 1):
+            wx = i * grid_step
+            p_top = self.to_screen(wx, max(cnc_min_y, cnc_max_y))
+            p_bot = self.to_screen(wx, min(cnc_min_y, cnc_max_y))
+            painter.drawLine(p_top, p_bot)
 
-        for i in range(-5, int(max_extent / step_mm) + 5):
-            val = i * step_mm
-            # Vertical line
-            p1 = self.to_screen(val, -max_extent)
-            p2 = self.to_screen(val, max_extent)
-            painter.drawLine(p1, p2)
-            # Horizontal line
-            p3 = self.to_screen(-max_extent, val)
-            p4 = self.to_screen(max_extent, val)
-            painter.drawLine(p3, p4)
+            if i != 0 and abs(wx) >= 1e-4 and 0 <= p_bot.x() <= w:
+                painter.setPen(QColor(154, 160, 166))
+                lbl = f"{wx:.0f}" if grid_step >= 1.0 else f"{wx:.1f}"
+                painter.drawText(int(p_bot.x() + 3), h - 4, lbl)
+                painter.setPen(grid_pen)
+
+        # Horizontal grid lines
+        for j in range(start_y_idx, end_y_idx + 1):
+            wy = j * grid_step
+            p_left = self.to_screen(min(cnc_min_x, cnc_max_x), wy)
+            p_right = self.to_screen(max(cnc_min_x, cnc_max_x), wy)
+            painter.drawLine(p_left, p_right)
+
+            if j != 0 and abs(wy) >= 1e-4 and 0 <= p_left.y() <= h:
+                painter.setPen(QColor(154, 160, 166))
+                lbl = f"{wy:.0f}" if grid_step >= 1.0 else f"{wy:.1f}"
+                painter.drawText(6, int(p_left.y() - 3), lbl)
+                painter.setPen(grid_pen)
 
         painter.restore()
 
@@ -386,31 +569,108 @@ class ToolpathCanvasWidget(QWidget):
         painter.restore()
 
     def _draw_origin_axes(self, painter: QPainter):
-        """Draw CNC coordinate origin O(0,0) and X/Y direction arrows."""
+        """Draw G54 coordinate target origin O(0,0) and +X/+Y direction arrows."""
         painter.save()
         origin_pt = self.to_screen(0.0, 0.0)
 
-        # Origin circle
-        painter.setPen(QPen(QColor(0, 0, 0), 1.5))
+        # Target circle marker (G54)
+        painter.setPen(QPen(SIM_TOOL_CENTER, 1.5))
         painter.setBrush(QBrush(QColor(255, 255, 255)))
-        painter.drawEllipse(origin_pt, 4.0, 4.0)
+        painter.drawEllipse(origin_pt, 5.0, 5.0)
+        painter.drawEllipse(origin_pt, 1.5, 1.5)
 
-        # X Axis Arrow (Red, horizontal to right)
-        arrow_len = 35.0
+        # Text label G54 (0,0)
+        painter.setPen(QColor(32, 33, 36))
+        painter.setFont(QFont("Monospace", 9, QFont.Weight.Bold))
+        painter.drawText(int(origin_pt.x() + 8), int(origin_pt.y() + 16), "G54 (0,0)")
+
+        # +X Axis Line & Arrow (Red)
+        painter.setPen(QPen(SIM_AXIS_X_COLOR, 1.8))
+        arrow_len = 40.0
         x_end = QPointF(origin_pt.x() + arrow_len, origin_pt.y())
-        painter.setPen(QPen(QColor(211, 47, 47), 2))
         painter.drawLine(origin_pt, x_end)
-        painter.drawText(int(x_end.x() + 4), int(x_end.y() + 4), "X+")
+        painter.drawLine(x_end, QPointF(x_end.x() - 6, x_end.y() - 4))
+        painter.drawLine(x_end, QPointF(x_end.x() - 6, x_end.y() + 4))
+        painter.drawText(int(x_end.x() + 4), int(x_end.y() + 4), "+X (mm)")
 
-        # Y Axis Arrow (Green, vertical upwards)
+        # +Y Axis Line & Arrow (Green)
+        painter.setPen(QPen(SIM_AXIS_Y_COLOR, 1.8))
         y_end = QPointF(origin_pt.x(), origin_pt.y() - arrow_len)
-        painter.setPen(QPen(QColor(46, 125, 50), 2))
         painter.drawLine(origin_pt, y_end)
-        painter.drawText(int(y_end.x() - 6), int(y_end.y() - 6), "Y+")
+        painter.drawLine(y_end, QPointF(y_end.x() - 4, y_end.y() + 6))
+        painter.drawLine(y_end, QPointF(y_end.x() + 4, y_end.y() + 6))
+        painter.drawText(int(y_end.x() - 10), int(y_end.y() - 6), "+Y (mm)")
 
-        # Origin O mark
-        painter.setPen(QColor(0, 0, 0))
-        painter.drawText(int(origin_pt.x() - 14), int(origin_pt.y() + 14), "O(0,0)")
+        painter.restore()
+
+    def _draw_direction_arrow(self, painter: QPainter, p1: QPointF, p2: QPointF, color: QColor):
+        """Draw subtle chevrons along path moves to show cutting direction."""
+        dx = p2.x() - p1.x()
+        dy = p2.y() - p1.y()
+        length = math.hypot(dx, dy)
+        if length < 22.0:
+            return
+
+        mx = (p1.x() + p2.x()) / 2.0
+        my = (p1.y() + p2.y()) / 2.0
+        ux = dx / length
+        uy = dy / length
+        nx = -uy
+        ny = ux
+
+        arrow_len = 5.0
+        arrow_w = 3.5
+        tip_x = mx + ux * (arrow_len * 0.5)
+        tip_y = my + uy * (arrow_len * 0.5)
+        w1_x = mx - ux * (arrow_len * 0.5) + nx * arrow_w
+        w1_y = my - uy * (arrow_len * 0.5) + ny * arrow_w
+        w2_x = mx - ux * (arrow_len * 0.5) - nx * arrow_w
+        w2_y = my - uy * (arrow_len * 0.5) - ny * arrow_w
+
+        painter.save()
+        painter.setPen(QPen(color, 1.5, Qt.PenStyle.SolidLine))
+        painter.drawLine(QPointF(w1_x, w1_y), QPointF(tip_x, tip_y))
+        painter.drawLine(QPointF(tip_x, tip_y), QPointF(w2_x, w2_y))
+        painter.restore()
+
+    def _get_segment_screen_points(self, seg: ToolpathSegment, steps: int = 24) -> List[QPointF]:
+        """Convert segment into screen points, interpolating G02/G03 arcs into smooth curves."""
+        if not seg.is_arc or seg.arc_radius <= 1e-4 or seg.arc_center is None:
+            return [
+                self.to_screen(seg.start[0], seg.start[1]),
+                self.to_screen(seg.end[0], seg.end[1]),
+            ]
+
+        cx, cy = seg.arc_center
+        rad = seg.arc_radius
+        start_a = seg.arc_start_angle
+        sweep_a = seg.arc_sweep_angle
+        n_pts = max(steps, int(abs(sweep_a) / (math.pi / 16.0)))
+        pts: List[QPointF] = []
+        for s in range(n_pts + 1):
+            frac = s / n_pts
+            ang = start_a + sweep_a * frac
+            px = cx + rad * math.cos(ang)
+            py = cy + rad * math.sin(ang)
+            pts.append(self.to_screen(px, py))
+        return pts
+
+    def _draw_traveled_trail(self, painter: QPainter):
+        """Draw highlighted trail over paths that have already been machined."""
+        if not self.show_traveled or not self.segments or self.current_segment_idx == 0:
+            return
+
+        painter.save()
+        traveled_pen = QPen(SIM_TRAVELED_COLOR, 2.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(traveled_pen)
+
+        for i in range(min(self.current_segment_idx, len(self.segments))):
+            seg = self.segments[i]
+            if seg.motion_type != "G00":
+                pts = self._get_segment_screen_points(seg)
+                if len(pts) >= 2:
+                    painter.drawPolyline(pts)
+
         painter.restore()
 
     def _draw_toolpaths(self, painter: QPainter):
@@ -421,76 +681,109 @@ class ToolpathCanvasWidget(QWidget):
         painter.save()
         band_radius_px = (self.tool_diameter / 2.0) * self.scale
 
-        # 1. Background ghost paths (future segments yet to be executed)
-        ghost_pen = QPen(QColor(220, 220, 220), 1, Qt.PenStyle.DotLine)
+        # 1. Background ghost paths (future segments)
+        ghost_pen = QPen(QColor(220, 224, 230), 1, Qt.PenStyle.DotLine)
         painter.setPen(ghost_pen)
         for seg in self.segments[self.current_segment_idx:]:
-            p1 = self.to_screen(seg.start[0], seg.start[1])
-            p2 = self.to_screen(seg.end[0], seg.end[1])
-            painter.drawLine(p1, p2)
+            pts = self._get_segment_screen_points(seg)
+            if len(pts) >= 2:
+                painter.drawPolyline(pts)
 
         # 2. Executed path segments (up to current_segment_idx)
         for i in range(min(self.current_segment_idx, len(self.segments))):
             seg = self.segments[i]
-            p1 = self.to_screen(seg.start[0], seg.start[1])
-            p2 = self.to_screen(seg.end[0], seg.end[1])
+            pts = self._get_segment_screen_points(seg)
+            if len(pts) < 2:
+                continue
 
             if seg.motion_type == "G00":
-                # Rapid move: dashed orange-red line
-                rapid_pen = QPen(QColor(230, 81, 0), 1.5, Qt.PenStyle.DashLine)
-                painter.setPen(rapid_pen)
-                painter.drawLine(p1, p2)
+                if self.show_rapids:
+                    rapid_pen = QPen(SIM_RAPID_COLOR, 1.2, Qt.PenStyle.DashLine)
+                    painter.setPen(rapid_pen)
+                    painter.drawPolyline(pts)
 
             elif seg.motion_type in ("G01", "G02", "G03"):
-                # Tool cut width band (semi-transparent cyan/blue)
+                # Tool cut width band (semi-transparent)
                 if self.show_tool_band and band_radius_px > 1.0:
-                    band_pen = QPen(QColor(33, 150, 243, 60), band_radius_px * 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+                    band_pen = QPen(QColor(30, 142, 62, 45), band_radius_px * 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
                     painter.setPen(band_pen)
-                    painter.drawLine(p1, p2)
+                    painter.drawPolyline(pts)
 
-                # Toolpath centerline: solid deep blue
-                cut_pen = QPen(QColor(25, 118, 210), 2.0, Qt.PenStyle.SolidLine)
+                # Toolpath centerline
+                c = SIM_LINEAR_COLOR if seg.motion_type == "G01" else (
+                    SIM_ARC_CW_COLOR if seg.motion_type == "G02" else SIM_ARC_CCW_COLOR
+                )
+                cut_pen = QPen(c, 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
                 painter.setPen(cut_pen)
-                painter.drawLine(p1, p2)
+                painter.drawPolyline(pts)
+
+                # Direction arrow
+                if self.show_arrows:
+                    mid_idx = len(pts) // 2
+                    if mid_idx < len(pts) - 1:
+                        self._draw_direction_arrow(painter, pts[mid_idx], pts[mid_idx + 1], c)
+                    else:
+                        self._draw_direction_arrow(painter, pts[0], pts[-1], c)
 
             elif seg.motion_type in ("G81", "G83"):
-                # Canned cycle drill hole marker
+                # Drill hole marker
                 hole_radius_px = max(3.0, (seg.hole_diameter / 2.0) * self.scale)
                 center_pt = self.to_screen(seg.end[0], seg.end[1])
 
-                # Outer drill circle
                 painter.setPen(QPen(QColor(123, 31, 162), 1.8, Qt.PenStyle.SolidLine))
-                painter.setBrush(QBrush(QColor(225, 190, 231, 120)))
+                painter.setBrush(QBrush(QColor(225, 190, 231, 130)))
                 painter.drawEllipse(center_pt, hole_radius_px, hole_radius_px)
 
-                # Center crosshair
                 painter.setPen(QPen(QColor(123, 31, 162), 1.2))
                 painter.drawLine(QPointF(center_pt.x() - 5, center_pt.y()), QPointF(center_pt.x() + 5, center_pt.y()))
                 painter.drawLine(QPointF(center_pt.x(), center_pt.y() - 5), QPointF(center_pt.x(), center_pt.y() + 5))
+
+        # 3. Draw Traveled Highlight Trail over executed cuts
+        self._draw_traveled_trail(painter)
+
+        # 4. Start (Green) and End (Red) Nodes
+        if self.segments:
+            start_pt = self.to_screen(self.segments[0].start[0], self.segments[0].start[1])
+            painter.setPen(QPen(QColor(22, 163, 74), 1.5))
+            painter.setBrush(QBrush(QColor(34, 197, 94)))
+            painter.drawEllipse(start_pt, 4.0, 4.0)
+
+            last_seg = self.segments[-1]
+            end_pt = self.to_screen(last_seg.end[0], last_seg.end[1])
+            painter.setPen(QPen(QColor(220, 38, 38), 1.5))
+            painter.setBrush(QBrush(QColor(239, 68, 68)))
+            painter.drawEllipse(end_pt, 4.0, 4.0)
 
         painter.restore()
 
     def _draw_tool_cutter(self, painter: QPainter):
         """Draw the animated cutter tool with current X, Y, Z readout."""
+        if not self.show_cutter:
+            return
+
         painter.save()
         cur_x, cur_y, cur_z = self.tool_pos
         center_pt = self.to_screen(cur_x, cur_y)
         tool_radius_px = max(4.0, (self.tool_diameter / 2.0) * self.scale)
 
-        # Cutter body: yellow circle with dark border
-        painter.setPen(QPen(QColor(230, 81, 0), 2, Qt.PenStyle.SolidLine))
-        painter.setBrush(QBrush(QColor(255, 193, 7, 160)))
+        # Circular Cutter Body (semi-transparent with orange outline)
+        painter.setPen(QPen(SIM_TOOL_OUTLINE, 1.8, Qt.PenStyle.SolidLine))
+        painter.setBrush(QBrush(SIM_TOOL_FILL))
         painter.drawEllipse(center_pt, tool_radius_px, tool_radius_px)
 
         # Center precision crosshair
-        painter.setPen(QPen(QColor(0, 0, 0), 1.5))
+        painter.setPen(QPen(QColor(255, 255, 255), 1.5))
+        painter.setBrush(QBrush(SIM_TOOL_CENTER))
+        painter.drawEllipse(center_pt, 3.5, 3.5)
+
+        painter.setPen(QPen(SIM_TOOL_CENTER, 1.2))
         painter.drawLine(QPointF(center_pt.x() - tool_radius_px - 4, center_pt.y()), QPointF(center_pt.x() + tool_radius_px + 4, center_pt.y()))
         painter.drawLine(QPointF(center_pt.x(), center_pt.y() - tool_radius_px - 4), QPointF(center_pt.x(), center_pt.y() + tool_radius_px + 4))
 
         # Position label badge
         pos_text = f"X:{cur_x:.2f} Y:{cur_y:.2f} Z:{cur_z:.2f}"
         painter.setFont(QFont("Monospace", 8, QFont.Weight.Bold))
-        painter.setPen(QColor(26, 26, 26))
+        painter.setPen(QColor(32, 33, 36))
         painter.drawText(int(center_pt.x() + tool_radius_px + 6), int(center_pt.y() - 4), pos_text)
 
         painter.restore()
@@ -499,7 +792,7 @@ class ToolpathCanvasWidget(QWidget):
 class CNCToolpathSimulatorWidget(QWidget):
     """
     Main CNC Toolpath Simulator Widget.
-    Combines Playback Controls, Canvas Viewport, Scrubber Slider, DRO and Statistics.
+    Combines Playback Controls, Canvas Viewport, Scrubber Slider, DRO, View Toggles and Envelope Stats.
     """
 
     def __init__(self, parent: Optional[QWidget] = None):
@@ -524,7 +817,7 @@ class CNCToolpathSimulatorWidget(QWidget):
         root_layout.setSpacing(6)
 
         # ---------------------------------------------------------------------
-        # 1. Top Toolbar (Controls, Speed, Zoom, Tool Band)
+        # 1. Top Toolbar (Controls, Speed, Zoom)
         # ---------------------------------------------------------------------
         toolbar_frame = QFrame(self)
         toolbar_frame.setStyleSheet("QFrame { background-color: #f8f9fa; border: 1px solid #1a1a1a; padding: 4px; }")
@@ -538,8 +831,15 @@ class CNCToolpathSimulatorWidget(QWidget):
         self.btn_run.clicked.connect(self.toggle_run)
         tb_layout.addWidget(self.btn_run)
 
-        self.btn_step = QPushButton("Từng bước (Step)", toolbar_frame)
+        self.btn_step_back = QPushButton("Lùi (Back)", toolbar_frame)
+        self.btn_step_back.setFixedHeight(28)
+        self.btn_step_back.setToolTip("Lùi lại 1 bước di chuyển")
+        self.btn_step_back.clicked.connect(self.step_backward)
+        tb_layout.addWidget(self.btn_step_back)
+
+        self.btn_step = QPushButton("Tiến (Step)", toolbar_frame)
         self.btn_step.setFixedHeight(28)
+        self.btn_step.setToolTip("Tiến tới 1 bước di chuyển")
         self.btn_step.clicked.connect(self.step_forward)
         tb_layout.addWidget(self.btn_step)
 
@@ -583,26 +883,60 @@ class CNCToolpathSimulatorWidget(QWidget):
         self.btn_zoom_reset.clicked.connect(self._zoom_reset)
         tb_layout.addWidget(self.btn_zoom_reset)
 
-        tb_layout.addSpacing(10)
-
-        # Checkbox Tool Band
-        self.chk_tool_band = QCheckBox("Vệt cắt dao (Tool Band)", toolbar_frame)
-        self.chk_tool_band.setChecked(True)
-        self.chk_tool_band.toggled.connect(self._on_toggle_tool_band)
-        tb_layout.addWidget(self.chk_tool_band)
-
         tb_layout.addStretch()
         root_layout.addWidget(toolbar_frame)
 
         # ---------------------------------------------------------------------
-        # 2. Center Viewport (Canvas)
+        # 2. View Toggles Bar (Grid, Rapids, Arrows, Tool Band, Traveled Trail)
+        # ---------------------------------------------------------------------
+        toggles_frame = QFrame(self)
+        toggles_frame.setStyleSheet("QFrame { background-color: #ffffff; border: 1px solid #d0d7de; padding: 2px 6px; }")
+        tog_layout = QHBoxLayout(toggles_frame)
+        tog_layout.setContentsMargins(4, 2, 4, 2)
+        tog_layout.setSpacing(12)
+
+        self.chk_grid = QCheckBox("Lưới", toggles_frame)
+        self.chk_grid.setToolTip("Bật/tắt lưới tọa độ milimét")
+        self.chk_grid.setChecked(True)
+        self.chk_grid.toggled.connect(self._on_toggle_grid)
+        tog_layout.addWidget(self.chk_grid)
+
+        self.chk_rapids = QCheckBox("G00", toggles_frame)
+        self.chk_rapids.setToolTip("Bật/tắt đường chạy dao nhanh G00")
+        self.chk_rapids.setChecked(True)
+        self.chk_rapids.toggled.connect(self._on_toggle_rapids)
+        tog_layout.addWidget(self.chk_rapids)
+
+        self.chk_arrows = QCheckBox("Hướng dao", toggles_frame)
+        self.chk_arrows.setToolTip("Bật/tắt mũi tên chỉ hướng chạy dao")
+        self.chk_arrows.setChecked(True)
+        self.chk_arrows.toggled.connect(self._on_toggle_arrows)
+        tog_layout.addWidget(self.chk_arrows)
+
+        self.chk_tool_band = QCheckBox("Vệt cắt", toggles_frame)
+        self.chk_tool_band.setToolTip("Bật/tắt vệt cắt rộng bán kính dao")
+        self.chk_tool_band.setChecked(True)
+        self.chk_tool_band.toggled.connect(self._on_toggle_tool_band)
+        tog_layout.addWidget(self.chk_tool_band)
+
+        self.chk_traveled = QCheckBox("Vệt đã chạy", toggles_frame)
+        self.chk_traveled.setToolTip("Bật/tắt vệt chạy dao đã hoàn thành")
+        self.chk_traveled.setChecked(True)
+        self.chk_traveled.toggled.connect(self._on_toggle_traveled)
+        tog_layout.addWidget(self.chk_traveled)
+
+        tog_layout.addStretch()
+        root_layout.addWidget(toggles_frame)
+
+        # ---------------------------------------------------------------------
+        # 3. Center Viewport (Canvas)
         # ---------------------------------------------------------------------
         self.canvas = ToolpathCanvasWidget(self)
         self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         root_layout.addWidget(self.canvas, stretch=1)
 
         # ---------------------------------------------------------------------
-        # 3. Scrubber Slider
+        # 4. Scrubber Slider & Timeline Readout
         # ---------------------------------------------------------------------
         scrub_frame = QFrame(self)
         scrub_frame.setStyleSheet("QFrame { background-color: #f8f9fa; border: 1px solid #1a1a1a; padding: 2px 6px; }")
@@ -619,58 +953,88 @@ class CNCToolpathSimulatorWidget(QWidget):
         self.slider_scrub.valueChanged.connect(self._on_scrubber_changed)
         scrub_layout.addWidget(self.slider_scrub, stretch=1)
 
-        self.lbl_scrub_counter = QLabel("0 / 0 bước", scrub_frame)
-        self.lbl_scrub_counter.setFixedWidth(80)
+        self.lbl_scrub_counter = QLabel("00:00 / 00:00 (0%) | 0 / 0 bước", scrub_frame)
+        self.lbl_scrub_counter.setFixedWidth(230)
+        self.lbl_scrub_counter.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.lbl_scrub_counter.setStyleSheet("font-family: monospace; font-size: 11px;")
         scrub_layout.addWidget(self.lbl_scrub_counter)
 
         root_layout.addWidget(scrub_frame)
 
         # ---------------------------------------------------------------------
-        # 4. Digital Readout (DRO) Cards
+        # 5. Digital Readout (DRO) Cards
         # ---------------------------------------------------------------------
         dro_frame = QFrame(self)
         dro_frame.setStyleSheet("QFrame { background-color: #f0f0f0; border: 1px solid #1a1a1a; }")
         dro_layout = QGridLayout(dro_frame)
-        dro_layout.setContentsMargins(6, 6, 6, 6)
-        dro_layout.setHorizontalSpacing(8)
+        dro_layout.setContentsMargins(4, 4, 4, 4)
+        dro_layout.setHorizontalSpacing(4)
         dro_layout.setVerticalSpacing(4)
+        for c in range(6):
+            dro_layout.setColumnStretch(c, 1)
 
-        card_style = "background-color: #ffffff; border: 1px solid #999999; padding: 4px; font-family: monospace;"
+        card_style = "background-color: #ffffff; border: 1px solid #999999; padding: 2px; font-family: monospace; font-size: 11px;"
 
         self.dro_x = QLabel("X: 0.000 mm", dro_frame)
         self.dro_x.setStyleSheet(card_style)
+        self.dro_x.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.dro_x.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.dro_x.setFixedHeight(24)
         dro_layout.addWidget(self.dro_x, 0, 0)
 
         self.dro_y = QLabel("Y: 0.000 mm", dro_frame)
         self.dro_y.setStyleSheet(card_style)
+        self.dro_y.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.dro_y.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.dro_y.setFixedHeight(24)
         dro_layout.addWidget(self.dro_y, 0, 1)
 
         self.dro_z = QLabel("Z: 50.000 mm", dro_frame)
         self.dro_z.setStyleSheet(card_style)
+        self.dro_z.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.dro_z.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.dro_z.setFixedHeight(24)
         dro_layout.addWidget(self.dro_z, 0, 2)
 
         self.dro_feed = QLabel("F: 0 mm/min", dro_frame)
         self.dro_feed.setStyleSheet(card_style)
+        self.dro_feed.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.dro_feed.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.dro_feed.setFixedHeight(24)
         dro_layout.addWidget(self.dro_feed, 0, 3)
 
         self.dro_spindle = QLabel("S: 0 RPM", dro_frame)
         self.dro_spindle.setStyleSheet(card_style)
+        self.dro_spindle.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.dro_spindle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.dro_spindle.setFixedHeight(24)
         dro_layout.addWidget(self.dro_spindle, 0, 4)
 
+        self.dro_motion = QLabel("Mode: Idle", dro_frame)
+        self.dro_motion.setStyleSheet("background-color: #ffffff; border: 1px solid #999999; padding: 2px; font-weight: bold; color: #2e7d32; font-family: monospace; font-size: 11px;")
+        self.dro_motion.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.dro_motion.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.dro_motion.setFixedHeight(24)
+        dro_layout.addWidget(self.dro_motion, 0, 5)
+
         self.dro_cmd = QLabel("Lệnh: (Sẵn sàng)", dro_frame)
-        self.dro_cmd.setStyleSheet("background-color: #ffffff; border: 1px solid #999999; padding: 4px; font-weight: bold; color: #0d47a1;")
-        dro_layout.addWidget(self.dro_cmd, 1, 0, 1, 5)
+        self.dro_cmd.setStyleSheet("background-color: #ffffff; border: 1px solid #999999; padding: 2px 6px; font-weight: bold; color: #0d47a1; font-family: monospace; font-size: 11px;")
+        self.dro_cmd.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.dro_cmd.setFixedHeight(24)
+        dro_layout.addWidget(self.dro_cmd, 1, 0, 1, 6)
 
         root_layout.addWidget(dro_frame)
 
         # ---------------------------------------------------------------------
-        # 5. Statistics Footer
+        # 6. Envelope & Statistics Footer
         # ---------------------------------------------------------------------
         self.lbl_stats = QLabel(
-            "Thống kê: Chiều dài cắt: 0.0 mm | Chạy nhanh: 0.0 mm | Tổng bước: 0 | Thời gian ước tính: 0:00",
+            "Bao gia công: 0.0 x 0.0 mm | Chiều dài cắt: 0.0 mm | Chạy nhanh: 0.0 mm | Tổng bước: 0 | Thời gian ước tính: 00:00",
             self,
         )
         self.lbl_stats.setStyleSheet("color: #333333; font-size: 11px; padding: 2px;")
+        self.lbl_stats.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.lbl_stats.setFixedHeight(20)
         root_layout.addWidget(self.lbl_stats)
 
     # -------------------------------------------------------------------------
@@ -687,14 +1051,14 @@ class CNCToolpathSimulatorWidget(QWidget):
         total_moves = len(self.segments)
         self.slider_scrub.setRange(0, total_moves)
         self.slider_scrub.setValue(0)
-        self.lbl_scrub_counter.setText(f"0 / {total_moves} bước")
 
-        # Format stats
+        # Format stats & envelope
         mins = int(self.parser.est_time_seconds // 60)
         secs = int(self.parser.est_time_seconds % 60)
-        time_str = f"{mins}:{secs:02d}"
+        time_str = f"{mins:02d}:{secs:02d}"
         self.lbl_stats.setText(
-            f"Thống kê: Chiều dài cắt: {self.parser.total_cut_dist:.1f} mm | "
+            f"Bao gia công: {self.parser.envelope_width:.1f} x {self.parser.envelope_height:.1f} mm | "
+            f"Chiều dài cắt: {self.parser.total_cut_dist:.1f} mm | "
             f"Chạy nhanh: {self.parser.total_rapid_dist:.1f} mm | "
             f"Tổng bước: {total_moves} | "
             f"Thời gian ước tính: {time_str}"
@@ -732,12 +1096,25 @@ class CNCToolpathSimulatorWidget(QWidget):
         self.timer.stop()
 
     def step_forward(self):
-        """Execute single block step."""
+        """Execute single block step forward."""
         if not self.segments:
             return
         self.pause_simulation()
         if self.current_idx < len(self.segments):
             self.current_idx += 1
+            self.canvas.set_current_step(self.current_idx)
+            self.slider_scrub.blockSignals(True)
+            self.slider_scrub.setValue(self.current_idx)
+            self.slider_scrub.blockSignals(False)
+            self._update_dro_display()
+
+    def step_backward(self):
+        """Execute single block step backward."""
+        if not self.segments:
+            return
+        self.pause_simulation()
+        if self.current_idx > 0:
+            self.current_idx -= 1
             self.canvas.set_current_step(self.current_idx)
             self.slider_scrub.blockSignals(True)
             self.slider_scrub.setValue(self.current_idx)
@@ -777,7 +1154,22 @@ class CNCToolpathSimulatorWidget(QWidget):
     def _update_dro_display(self):
         """Refresh DRO indicators."""
         total = len(self.segments)
-        self.lbl_scrub_counter.setText(f"{self.current_idx} / {total} bước")
+        total_time = self.parser.est_time_seconds
+
+        cur_time = 0.0
+        if self.segments and self.current_idx > 0:
+            active_idx = min(self.current_idx - 1, total - 1)
+            cur_time = self.segments[active_idx].time_end
+
+        cur_min = int(cur_time // 60)
+        cur_sec = int(cur_time % 60)
+        tot_min = int(total_time // 60)
+        tot_sec = int(total_time % 60)
+        pct = int((cur_time / total_time * 100.0)) if total_time > 0 else 0
+
+        self.lbl_scrub_counter.setText(
+            f"{cur_min:02d}:{cur_sec:02d} / {tot_min:02d}:{tot_sec:02d} ({pct}%) | {self.current_idx} / {total} bước"
+        )
 
         if not self.segments or self.current_idx == 0:
             self.dro_x.setText("X: 0.000 mm")
@@ -785,6 +1177,7 @@ class CNCToolpathSimulatorWidget(QWidget):
             self.dro_z.setText("Z: 50.000 mm")
             self.dro_feed.setText("F: 0 mm/min")
             self.dro_spindle.setText("S: 0 RPM")
+            self.dro_motion.setText("Mode: Idle")
             self.dro_cmd.setText("Lệnh: (Bắt đầu chương trình)")
             return
 
@@ -797,6 +1190,16 @@ class CNCToolpathSimulatorWidget(QWidget):
         self.dro_z.setText(f"Z: {cur_z:.3f} mm")
         self.dro_feed.setText(f"F: {seg.feed:.1f} mm/min")
         self.dro_spindle.setText(f"S: {seg.spindle} RPM")
+
+        mode_labels = {
+            "G00": "G00 (Rapid)",
+            "G01": "G01 (Linear Cut)",
+            "G02": "G02 (Arc CW)",
+            "G03": "G03 (Arc CCW)",
+            "G81": "G81 (Spot Drill)",
+            "G83": "G83 (Peck Drill)",
+        }
+        self.dro_motion.setText(f"Mode: {mode_labels.get(seg.motion_type, seg.motion_type)}")
         self.dro_cmd.setText(f"Lệnh [Dòng {seg.line_num}]: {seg.raw_text}")
 
     # -------------------------------------------------------------------------
@@ -811,8 +1214,24 @@ class CNCToolpathSimulatorWidget(QWidget):
         self.canvas.set_current_step(value)
         self._update_dro_display()
 
+    def _on_toggle_grid(self, checked: bool):
+        self.canvas.show_grid = checked
+        self.canvas.update()
+
+    def _on_toggle_rapids(self, checked: bool):
+        self.canvas.show_rapids = checked
+        self.canvas.update()
+
+    def _on_toggle_arrows(self, checked: bool):
+        self.canvas.show_arrows = checked
+        self.canvas.update()
+
     def _on_toggle_tool_band(self, checked: bool):
         self.canvas.show_tool_band = checked
+        self.canvas.update()
+
+    def _on_toggle_traveled(self, checked: bool):
+        self.canvas.show_traveled = checked
         self.canvas.update()
 
     def _zoom_in(self):

@@ -10,7 +10,7 @@ import logging
 
 from vision.schemas import DrawingIR, DrillHole, Point2D, SlotContour
 
-logger = logging.getLogger("vlm4cnc.dxf_engine")
+logger = logging.getLogger("vlm4cnc.core.dxf")
 
 
 def _generate_slot_contour_shapely(

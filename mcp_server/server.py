@@ -7,7 +7,7 @@ import json
 import logging
 from pathlib import Path
 import sys
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Union
 
 # Ensure project root is in sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -21,7 +21,7 @@ from vision.schemas import DrawingIR
 from core.dxf_engine import export_drawing_to_dxf
 from core.gcode_engine import generate_gcode
 
-logger = logging.getLogger("vlm4cnc.mcp_server")
+logger = logging.getLogger("vlm4cnc.mcp")
 
 # 1. Initialize FastMCP server
 mcp = FastMCP("cad-cam-mcp-server")
@@ -33,25 +33,30 @@ DEFAULT_GCODE_PATH = str(Path("outputs") / "part.nc")
 
 # 2. Tool 1: export_dxf_tool
 @mcp.tool()
-def export_dxf_tool(drawing_ir_json: str, output_path: str = DEFAULT_DXF_PATH) -> str:
+def export_dxf_tool(drawing_ir_json: Union[DrawingIR, str], output_path: str = DEFAULT_DXF_PATH) -> str:
     """
     Export 2D mechanical drawing intermediate representation (DrawingIR) to a standard AutoCAD DXF file.
 
     Args:
-        drawing_ir_json: JSON string representing DrawingIR model (stock dimensions, holes, slots).
+        drawing_ir_json: DrawingIR model object or JSON string representing DrawingIR model (stock dimensions, holes, slots).
         output_path: Target path for the output .dxf file (e.g., 'outputs/part.dxf').
 
     Returns:
         Status message with the absolute path of the generated DXF file, or error message.
     """
     try:
-        # Validate input JSON against DrawingIR schema
-        try:
-            drawing_data = DrawingIR.model_validate_json(drawing_ir_json)
-        except ValidationError as val_err:
-            return f"[ERROR] Invalid DrawingIR schema validation failed:\n{val_err}"
-        except Exception as json_err:
-            return f"[ERROR] Failed to parse DrawingIR JSON string: {json_err}"
+        # Validate or accept input DrawingIR
+        if isinstance(drawing_ir_json, DrawingIR):
+            drawing_data = drawing_ir_json
+        elif isinstance(drawing_ir_json, str):
+            try:
+                drawing_data = DrawingIR.model_validate_json(drawing_ir_json)
+            except ValidationError as val_err:
+                return f"[ERROR] Invalid DrawingIR schema validation failed:\n{val_err}"
+            except Exception as json_err:
+                return f"[ERROR] Failed to parse DrawingIR JSON string: {json_err}"
+        else:
+            return f"[ERROR] drawing_ir_json must be DrawingIR or JSON string, got {type(drawing_ir_json).__name__}"
 
         # Resolve destination path using pathlib.Path
         target_path = Path(output_path).resolve()
@@ -70,16 +75,16 @@ def export_dxf_tool(drawing_ir_json: str, output_path: str = DEFAULT_DXF_PATH) -
 # 3. Tool 2: generate_gcode_tool
 @mcp.tool()
 def generate_gcode_tool(
-    drawing_ir_json: str,
-    params_json: str = "{}",
+    drawing_ir_json: Union[DrawingIR, str],
+    params_json: Union[Dict[str, Any], str] = "{}",
     output_path: str = DEFAULT_GCODE_PATH,
 ) -> str:
     """
     Generate CNC G-Code program from DrawingIR and machining parameters.
 
     Args:
-        drawing_ir_json: JSON string representing DrawingIR model.
-        params_json: JSON string containing machining settings:
+        drawing_ir_json: DrawingIR model object or JSON string representing DrawingIR model.
+        params_json: JSON string or dict containing machining settings:
             - feedrate_xy: Horizontal cutting feedrate (mm/min, e.g. 800)
             - plunge_feed: Plunge feedrate (mm/min, e.g. 300)
             - spindle_speed: Spindle speed (RPM, e.g. 12000)
@@ -95,15 +100,20 @@ def generate_gcode_tool(
         Status message with output path and a 20-line preview of the generated G-code, or error message.
     """
     try:
-        # Validate DrawingIR JSON
-        try:
-            drawing_data = DrawingIR.model_validate_json(drawing_ir_json)
-        except ValidationError as val_err:
-            return f"[ERROR] Invalid DrawingIR schema validation failed:\n{val_err}"
-        except Exception as json_err:
-            return f"[ERROR] Failed to parse DrawingIR JSON string: {json_err}"
+        # Validate DrawingIR
+        if isinstance(drawing_ir_json, DrawingIR):
+            drawing_data = drawing_ir_json
+        elif isinstance(drawing_ir_json, str):
+            try:
+                drawing_data = DrawingIR.model_validate_json(drawing_ir_json)
+            except ValidationError as val_err:
+                return f"[ERROR] Invalid DrawingIR schema validation failed:\n{val_err}"
+            except Exception as json_err:
+                return f"[ERROR] Failed to parse DrawingIR JSON string: {json_err}"
+        else:
+            return f"[ERROR] drawing_ir_json must be DrawingIR or JSON string, got {type(drawing_ir_json).__name__}"
 
-        # Validate machining parameters JSON
+        # Validate machining parameters JSON / dict
         try:
             if isinstance(params_json, str):
                 machining_params = json.loads(params_json) if params_json.strip() else {}

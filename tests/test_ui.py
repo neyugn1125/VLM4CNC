@@ -62,6 +62,7 @@ def test_main_window_3_columns_and_components(qapp):
     assert window.table_contour.columnCount() == 3
     assert window.table_contour.rowCount() == 5
     assert window.chk_mill_contour.isChecked() is True
+    assert window.chk_mill_holes.isChecked() is True
     assert window.spin_stock_w.value() == 100.0
     assert window.spin_stock_h.value() == 100.0
     assert window.spin_stock_t.value() == 10.0
@@ -99,6 +100,7 @@ def test_human_in_the_loop_table_editing(qapp):
     window._add_hole_row()
     window._add_hole_row()
     assert window.table_holes.rowCount() == 2
+    assert window.table_holes.item(0, 4).text() == "5.000"
 
     # Edit hole 1: X=25.0, Y=25.0, Dia=10.0, Depth=8.0
     window.table_holes.setItem(0, 1, QTableWidgetItem("25.000"))
@@ -283,4 +285,249 @@ def test_api_key_interaction_and_validation(qapp, tmp_path):
         assert window.vlm_worker is None
 
     window.close()
+
+
+def test_multiple_slots_grouping_and_new_slot_button(qapp):
+    """
+    Verify slot grouping, 'Thêm rãnh mới' button, and checkbox for racetrack slot milling:
+      1. Default chk_mill_slots is True.
+      2. _add_new_slot() correctly increments slot index label ('Rãnh 1', 'Rãnh 2', ...).
+      3. build_drawing_ir_from_tables() groups rows by slot label into independent SlotContour objects.
+      4. _populate_tables_from_drawing_ir() properly sets 'Rãnh 1', 'Rãnh 2', etc. in column 0.
+    """
+    window = MainWindow()
+
+    assert window.chk_mill_slots.isChecked() is True
+
+    # Check button 'Thêm rãnh mới'
+    assert hasattr(window, "btn_new_slot")
+    window.table_slots.setRowCount(0)
+
+    # Click add new slot -> Rãnh 1
+    window._add_new_slot()
+    assert window.table_slots.rowCount() == 2
+    assert window.table_slots.item(0, 0).text() == "Rãnh 1"
+    assert window.table_slots.item(1, 0).text() == "Rãnh 1"
+
+    # Set coordinates for Slot 1: (10, 80) -> (50, 80), width 12.0, depth 5.0
+    window.table_slots.setItem(0, 1, QTableWidgetItem("10.000"))
+    window.table_slots.setItem(0, 2, QTableWidgetItem("80.000"))
+    window.table_slots.setItem(0, 3, QTableWidgetItem("12.000"))
+    window.table_slots.setItem(0, 4, QTableWidgetItem("5.000"))
+
+    window.table_slots.setItem(1, 1, QTableWidgetItem("50.000"))
+    window.table_slots.setItem(1, 2, QTableWidgetItem("80.000"))
+    window.table_slots.setItem(1, 3, QTableWidgetItem("12.000"))
+    window.table_slots.setItem(1, 4, QTableWidgetItem("5.000"))
+
+    # Click add new slot again -> Rãnh 2
+    window._add_new_slot()
+    assert window.table_slots.rowCount() == 4
+    assert window.table_slots.item(2, 0).text() == "Rãnh 2"
+    assert window.table_slots.item(3, 0).text() == "Rãnh 2"
+
+    # Set coordinates for Slot 2: (20, 16) -> (80, 64), width 20.0, depth 5.0
+    window.table_slots.setItem(2, 1, QTableWidgetItem("20.000"))
+    window.table_slots.setItem(2, 2, QTableWidgetItem("16.000"))
+    window.table_slots.setItem(2, 3, QTableWidgetItem("20.000"))
+    window.table_slots.setItem(2, 4, QTableWidgetItem("5.000"))
+
+    window.table_slots.setItem(3, 1, QTableWidgetItem("80.000"))
+    window.table_slots.setItem(3, 2, QTableWidgetItem("64.000"))
+    window.table_slots.setItem(3, 3, QTableWidgetItem("20.000"))
+    window.table_slots.setItem(3, 4, QTableWidgetItem("5.000"))
+
+    # Reconstruct DrawingIR
+    ir = window.build_drawing_ir_from_tables()
+    assert len(ir.slots) == 2, f"Expected 2 independent slots, got {len(ir.slots)}"
+
+    assert ir.slots[0].width == 12.0
+    assert ir.slots[0].depth == 5.0
+    assert len(ir.slots[0].centerline_path) == 2
+    assert ir.slots[0].centerline_path[0].x == 10.0
+    assert ir.slots[0].centerline_path[1].x == 50.0
+
+    assert ir.slots[1].width == 20.0
+    assert ir.slots[1].depth == 5.0
+    assert len(ir.slots[1].centerline_path) == 2
+    assert ir.slots[1].centerline_path[0].x == 20.0
+    assert ir.slots[1].centerline_path[1].x == 80.0
+
+    # Test populate back to tables
+    window._populate_tables_from_drawing_ir(ir)
+    assert window.table_slots.rowCount() == 4
+    assert window.table_slots.item(0, 0).text() == "Rãnh 1"
+    assert window.table_slots.item(1, 0).text() == "Rãnh 1"
+    assert window.table_slots.item(2, 0).text() == "Rãnh 2"
+    assert window.table_slots.item(3, 0).text() == "Rãnh 2"
+
+    window.close()
+
+
+def test_drawing_table_model_qt(qapp):
+    """Kiem thu doc lap cac mo hinh QAbstractTableModel (Holes, Slots, Contour)."""
+    from PySide6.QtCore import Qt
+    from ui.models.drawing_table_model import (
+        HolesTableModel,
+        SlotsTableModel,
+        ContourTableModel,
+    )
+
+    # 1. HolesTableModel
+    holes = [
+        DrillHole(center=Point2D(x=10.0, y=20.0), diameter=5.0, depth=6.0),
+        DrillHole(center=Point2D(x=40.0, y=50.0), diameter=8.0, depth=10.0),
+    ]
+    model_holes = HolesTableModel(holes)
+    assert model_holes.rowCount() == 2
+    assert model_holes.columnCount() == 5
+    assert model_holes.headerData(1, Qt.Orientation.Horizontal) == "Tọa độ X (mm)"
+
+    # Doc du lieu dong 0
+    idx_x0 = model_holes.index(0, 1)
+    assert model_holes.data(idx_x0) == "10.000"
+
+    # Chinh sua du lieu qua setData
+    success = model_holes.setData(idx_x0, "15.5", Qt.ItemDataRole.EditRole)
+    assert success is True
+    assert model_holes.data(idx_x0) == "15.500"
+
+    # Them va xoa lo khoan
+    model_holes.add_hole(DrillHole(center=Point2D(x=70.0, y=70.0), diameter=12.0))
+    assert model_holes.rowCount() == 3
+    assert model_holes.remove_hole(0) is True
+    assert model_holes.rowCount() == 2
+
+    # 2. SlotsTableModel
+    slots = [
+        SlotContour(
+            width=10.0,
+            depth=4.0,
+            centerline_path=[Point2D(x=0.0, y=0.0), Point2D(x=50.0, y=0.0)],
+        )
+    ]
+    model_slots = SlotsTableModel(slots)
+    assert model_slots.rowCount() == 2  # 2 diem tren duong tam
+    assert model_slots.data(model_slots.index(0, 0)) == "Rãnh 1"
+
+    # 3. ContourTableModel
+    contour = [Point2D(x=0.0, y=0.0), Point2D(x=100.0, y=0.0), Point2D(x=100.0, y=100.0)]
+    model_contour = ContourTableModel(contour)
+    assert model_contour.rowCount() == 3
+    assert model_contour.data(model_contour.index(1, 1)) == "100.000"
+
+
+def test_table_data_adapter(qapp):
+    """Kiem thu TableDataAdapter chuyen doi 2 chieu voi QTableWidget."""
+    from PySide6.QtWidgets import QTableWidget
+    from ui.models.drawing_table_model import TableDataAdapter
+
+    tbl_h = QTableWidget(0, 5)
+    tbl_s = QTableWidget(0, 5)
+    tbl_c = QTableWidget(0, 3)
+
+    adapter = TableDataAdapter(tbl_h, tbl_s, tbl_c)
+
+    # 1. Populate tu DrawingIR
+    test_ir = DrawingIR(
+        stock_width=120.0,
+        stock_height=90.0,
+        stock_thickness=15.0,
+        holes=[DrillHole(center=Point2D(x=20.0, y=30.0), diameter=6.0, depth=8.0)],
+        slots=[
+            SlotContour(
+                width=8.0,
+                depth=5.0,
+                centerline_path=[Point2D(x=10.0, y=10.0), Point2D(x=60.0, y=10.0)],
+            )
+        ],
+    )
+    adapter.populate_from_drawing_ir(test_ir)
+    assert tbl_h.rowCount() == 1
+    assert tbl_s.rowCount() == 2
+    assert tbl_c.rowCount() == 5  # 4 canh bao tu stock
+
+    # 2. Thao tac them dong qua Adapter
+    adapter.add_hole_row(x=50.0, y=50.0, diameter=10.0, depth=5.0)
+    assert tbl_h.rowCount() == 2
+
+    adapter.add_new_slot(width=12.0, depth=6.0)
+    assert tbl_s.rowCount() == 4  # 2 diem slot cu + 2 diem slot moi
+
+    # 3. Tais sinh DrawingIR
+    rebuilt_ir = adapter.build_drawing_ir(120.0, 90.0, 15.0)
+    assert len(rebuilt_ir.holes) == 2
+    assert len(rebuilt_ir.slots) == 2
+    assert rebuilt_ir.stock_width == 120.0
+
+
+def test_export_service_methods(qapp, tmp_path):
+    """Kiem thu ExportService xuat DXF va G-Code doc lap khong can MainWindow."""
+    from ui.services.export_service import ExportService
+
+    logs = []
+    service = ExportService(log_callback=lambda msg: logs.append(msg))
+
+    test_ir = DrawingIR(
+        stock_width=100.0,
+        stock_height=100.0,
+        holes=[DrillHole(center=Point2D(x=25.0, y=25.0), diameter=5.0, depth=5.0)],
+    )
+
+    # Xuat DXF
+    dxf_path = str(tmp_path / "standalone_test.dxf")
+    saved_dxf = service.export_dxf(test_ir, target_path=dxf_path)
+    assert saved_dxf == dxf_path
+    assert Path(dxf_path).exists()
+    assert Path(dxf_path).stat().st_size > 0
+
+    # Xuat G-Code
+    nc_path = str(tmp_path / "standalone_test.nc")
+    saved_nc, code_text = service.export_gcode(
+        test_ir,
+        params={"cut_depth_z": -5.0, "tool_diameter": 3.0},
+        target_path=nc_path,
+    )
+    assert saved_nc == nc_path
+    assert Path(nc_path).exists()
+    assert "G54" in code_text
+    assert len(logs) >= 2
+
+
+def test_vlm_controller_lifecycle(qapp, tmp_path):
+    """Kiem thu VLMController quan ly key, validation va luong Worker."""
+    from ui.controllers.vlm_controller import VLMController
+
+    controller = VLMController()
+
+    # Kiem tra validation
+    v_local, _ = controller.validate_api_key("local")
+    assert v_local is True
+
+    v_gemini, msg = controller.validate_api_key("gemini", key="")
+    assert v_gemini is False
+    assert "Gemini" in msg
+
+    controller.set_api_key("gemini", "AIzaSy-Test-Key-999")
+    v_gemini2, _ = controller.validate_api_key("gemini")
+    assert v_gemini2 is True
+    assert controller.get_api_key("gemini") == "AIzaSy-Test-Key-999"
+
+    # Kiem tra chay worker qua start_analysis
+    dummy_img = tmp_path / "dummy.png"
+    dummy_img.write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15c4")
+
+    mock_ir = DrawingIR(stock_width=80.0, stock_height=80.0)
+    received = []
+    controller.analysis_finished.connect(lambda ir, el: received.append(ir))
+
+    with patch("vision.vlm_parser.parse_drawing", return_value=mock_ir):
+        controller.start_analysis(dummy_img, provider="local")
+        assert controller.is_running() is True
+        controller.worker.wait(3000)
+        qapp.processEvents()
+
+    assert len(received) == 1
+    assert received[0].stock_width == 80.0
+
 

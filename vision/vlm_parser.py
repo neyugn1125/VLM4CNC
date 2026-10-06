@@ -13,14 +13,33 @@ import logging
 import os
 from pathlib import Path
 import re
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import httpx
 from pydantic import ValidationError
 
 from vision.schemas import DrawingIR, DrillHole, Point2D, SlotContour
 
-logger = logging.getLogger("vlm4cnc.vlm_parser")
+logger = logging.getLogger("vlm4cnc.vision")
+
+# Optional SDK imports with graceful degradation
+try:
+    import instructor
+    from openai import OpenAI
+    HAS_OPENAI = True
+except ImportError:
+    instructor = None  # type: ignore
+    OpenAI = None      # type: ignore
+    HAS_OPENAI = False
+
+try:
+    from google import genai
+    from google.genai import types
+    HAS_GEMINI = True
+except ImportError:
+    genai = None       # type: ignore
+    types = None       # type: ignore
+    HAS_GEMINI = False
 
 
 MECHANICAL_ENGINEERING_SYSTEM_PROMPT = """
@@ -37,7 +56,7 @@ CÁC NGUYÊN TẮC QUAN TRỌNG BẮT BUỘC TUÂN THỦ:
 2. KÍCH THƯỚC PHÔI CHỮ NHẬT (STOCK):
    - stock_width: Chiều rộng tổng thể theo phương trục X (mm).
    - stock_height: Chiều cao tổng thể theo phương trục Y (mm).
-   - stock_thickness: Chiều dày tấm phôi theo phương trục Z (mm).
+   - stock_thickness: Chiều dày tấm phôi theo phương trục Z (mm, mặc định 5.0 mm hoặc theo bản vẽ).
 
 3. PHƯƠNG PHÁP SUY LUẬN TỌA ĐỘ CỘNG DỒN (DIMENSION CHAINING):
    - Các kích thước trên bản vẽ cơ khí thường được dóng từ cạnh chuẩn (Datum edges).
@@ -45,44 +64,185 @@ CÁC NGUYÊN TẮC QUAN TRỌNG BẮT BUỘC TUÂN THỦ:
    - Tọa độ Y tuyệt đối = Khoảng cách dóng từ mép chuẩn BÊN DƯỚI tới tâm đối tượng (cộng dồn nếu dóng theo chuỗi).
    - Tuyệt đối không nhầm lẫn trục Y ảnh (gốc trên-trái) với trục Y gia công cơ khí (gốc dưới-trái).
 
-4. NHẬN DIỆN LỖ KHOAN (HOLES):
-   - Nhận diện ký hiệu Ø hoặc "DIA" là đường kính danh nghĩa của lỗ tròn.
-   - Tọa độ tâm (center: {x, y}) tính từ gốc O(0,0) ở góc dưới-trái.
-   - Chiều sâu lỗ (depth): Lấy theo ghi chú (ví dụ: "Ø10 THRU" -> depth = stock_thickness, hoặc "Ø10 x 15 DP" -> depth = 15).
+4. PHÂN BIỆT RÕ VÀ TRÍCH XUẤT ĐẦY ĐỦ HAI ĐẶC TRƯNG HÌNH HỌC (HOLES VÀ SLOTS):
+   Bản vẽ cơ khí có thể có: (a) Lỗ tròn, HOẶC (b) Rãnh phay, HOẶC (c) Cả hai.
+   Bạn BẮT BUỘC phải rà soát toàn bộ bề mặt phôi để nhận diện đầy đủ TẤT CẢ các đối tượng hình học bên trong:
 
-5. NHẬN DIỆN RÃNH PHAY (SLOTS):
-   - Nhận diện đường nét gạch-chấm-gạch (centerline) là đường tâm chạy dao của rãnh phay (centerline_path).
-   - Xác định tuần tự tọa độ các điểm uốn, đổi hướng, điểm đầu và điểm cuối của đường tâm từ gốc O(0,0).
-   - Bề rộng rãnh (width): Khoảng cách giữa 2 thành rãnh song song.
-   - Chiều sâu rãnh (depth): Chiều sâu cắt phay.
-   - Nếu bản vẽ không có rãnh phay (slots), trả về mảng rỗng "slots": [].
+   A. NHẬN DIỆN LỖ KHOAN (HOLES):
+      - Chỉ ghi nhận vào "holes" khi có ký hiệu đường kính Ø hoặc "DIA".
+      - Tọa độ tâm (center: {x, y}) tính từ gốc O(0,0) ở góc dưới-trái (dóng từ mép trái X và mép đáy Y).
+      - Chiều sâu gia công (depth): Mặc định CỐ ĐỊNH là 5.0 mm cho mọi lỗ (depth = 5.0).
+      - NẾU BẢN VẼ KHÔNG CÓ KÝ HIỆU Ø, mảng "holes" BẮT BUỘC để rỗng: [].
 
-6. NHẬN DIỆN CÁC CẠNH BIÊN DẠNG BAO NGOÀI CHI TIẾT (OUTER CONTOUR / EDGES):
+   B. NHẬN DIỆN RÃNH PHAY (SLOTS - OVAL / OBLONG / KEYWAY SLOTS):
+      - Rãnh phay là các rãnh thẳng, rãnh xiên hoặc rãnh cong có 2 cạnh song song và 2 đầu bo tròn, ở giữa có đường nét gạch-chấm-gạch (centerline) biểu diễn quỹ đạo chạy dao.
+      - Tọa độ đường tâm (centerline_path: [Point2D, Point2D]):
+        * Gồm danh sách các điểm tâm cung tròn ở 2 đầu rãnh (hoặc các điểm đổi hướng) từ gốc O(0,0).
+        * Lần theo từng đường dóng kích thước kéo thẳng xuống mép đáy để đọc tọa độ X của từng đầu rãnh.
+        * Lần theo từng đường dóng kích thước kéo ngang sang mép trái (hoặc mép phải) để đọc tọa độ Y của từng đầu rãnh.
+      - Bề rộng rãnh (width):
+        * Nếu bản vẽ ghi kích thước giữa 2 cạnh song song (ví dụ số 12), bề rộng width = 12.0 mm.
+        * Nếu bản vẽ ghi bán kính bo ở đầu rãnh là R (ví dụ R10, R4), bề rộng rãnh bằng hai lần bán kính: width = 2 * R (R10 -> width = 20.0 mm; R4 -> width = 8.0 mm).
+      - Chiều sâu gia công rãnh (depth):
+        * Đọc từ ghi chú t=... hoặc DP=... dọc theo rãnh (ví dụ t=3, t=4, t=2 -> depth tương ứng; nếu không ghi chú thì mặc định 5.0 mm).
+      - Nếu bản vẽ KHÔNG có rãnh phay, trả về "slots": [].
+
+5. NHẬN DIỆN CÁC CẠNH BIÊN DẠNG BAO NGOÀI CHI TIẾT (OUTER CONTOUR / EDGES):
    - Mọi chi tiết cơ khí đều có chu vi các cạnh bao ngoài để gia công phay biên dạng (outer_contour).
    - Với chi tiết hình vuông hoặc chữ nhật kích thước W x H, chuỗi tọa độ 4 cạnh khép kín từ gốc O(0,0) là:
      [{"x": 0.0, "y": 0.0}, {"x": W, "y": 0.0}, {"x": W, "y": H}, {"x": 0.0, "y": H}, {"x": 0.0, "y": 0.0}].
    - Nếu chi tiết có các cạnh vát (chamfer), bậc hoặc đa giác, ghi nhận tuần tự các đỉnh cạnh bao ngoài vào mảng outer_contour.
 
-7. BẮT BUỘC SUY LUẬN NỘI BỘ (CHAIN-OF-THOUGHT QUA TRƯỜNG "reasoning"):
+6. TẬP TRUNG TOÀN DIỆN VÀO HÌNH HỌC BIÊN DẠNG 2D (CHAIN-OF-THOUGHT QUA TRƯỜNG "reasoning"):
    - Trong schema JSON, trường "reasoning" là trường đầu tiên. Bạn PHẢI trình bày súc tích từng bước tính toán trong trường này:
      * Bước 1: Liệt kê kích thước phôi W, H, T.
-     * Bước 2: Xác định cạnh chuẩn (Datum A bên trái, Datum B bên dưới).
-     * Bước 3: Xác định tọa độ 4 cạnh bao ngoài chi tiết.
-     * Bước 4: Lần theo từng đường dóng kích thước cho từng lỗ và rãnh (ghi rõ: Lỗ 1 cách mép trái bao nhiêu mm -> X = ..., cách mép dưới bao nhiêu mm -> Y = ...).
-     * Bước 5: Điền các số liệu vào các trường còn lại.
+     * Bước 2: Kiểm tra lỗ tròn: có ký hiệu Ø nào không? Nếu không có thì ghi rõ holes=[].
+     * Bước 3: Rà soát tất cả các rãnh phay (slots): xác định đường tâm 2 đầu rãnh (tọa độ X, Y dóng từ mép chuẩn), bề rộng (số đo khoảng cách hoặc 2*R), chiều sâu t.
+     * Bước 4: Xác định 4 cạnh bao ngoài chi tiết outer_contour.
+     * Bước 5: Điền các số liệu chính xác vào JSON.
 
 VÍ DỤ CẤU TRÚC JSON ĐẦU RA MẪU:
 {
-  "reasoning": "1. Phôi kích thước 100x100x10 mm (W=100, H=100, T=10). Gốc O(0,0) tại góc dưới-trái. Cạnh trái là chuẩn X, cạnh đáy là chuẩn Y. 2. 4 cạnh bao ngoài chi tiết khép kín: (0,0) -> (100,0) -> (100,100) -> (0,100) -> (0,0). 3. Lỗ 1: dóng từ mép trái 25mm -> X=25.0; dóng từ mép đáy 25mm -> Y=25.0; Ø10 THRU -> dia=10.0, depth=10.0. 4. Lỗ 2: dóng từ mép trái 75mm -> X=75.0, mép đáy 50mm -> Y=50.0...",
+  "reasoning": "1. Phôi 100x100x5 mm. Gốc O(0,0) tại góc dưới-trái. 2. 4 cạnh bao ngoài: (0,0)->(100,0)->(100,100)->(0,100)->(0,0). 3. Bản vẽ có 3 rãnh phay: Rãnh 1 nằm ngang từ (10,80) đến (50,80), rộng 12mm, t=3; Rãnh 2 xiên từ (20,16) đến (80,64), bo đầu R10 -> rộng 20mm, t=4; Rãnh 3 xiên từ (65,28) đến (90,10), bo đầu R4 -> rộng 8mm, t=2. Không có lỗ tròn Ø nên holes=[].",
   "stock_width": 100.0,
   "stock_height": 100.0,
-  "stock_thickness": 10.0,
+  "stock_thickness": 5.0,
+  "holes": [],
+  "slots": [
+    {
+      "width": 12.0,
+      "centerline_path": [{"x": 10.0, "y": 80.0}, {"x": 50.0, "y": 80.0}],
+      "depth": 3.0
+    },
+    {
+      "width": 20.0,
+      "centerline_path": [{"x": 20.0, "y": 16.0}, {"x": 80.0, "y": 64.0}],
+      "depth": 4.0
+    },
+    {
+      "width": 8.0,
+      "centerline_path": [{"x": 65.0, "y": 28.0}, {"x": 90.0, "y": 10.0}],
+      "depth": 2.0
+    }
+  ],
+  "outer_contour": [
+    {"x": 0.0, "y": 0.0},
+    {"x": 100.0, "y": 0.0},
+    {"x": 100.0, "y": 100.0},
+    {"x": 0.0, "y": 100.0},
+    {"x": 0.0, "y": 0.0}
+  ]
+}
+"""
+
+PARSER_USER_PROMPT = (
+    "Hãy phân tích bản vẽ cơ khí 2D này. Trước tiên, hãy suy luận chi tiết "
+    "về mốc chuẩn và chuỗi kích thước dóng trong trường 'reasoning', "
+    "sau đó xuất chính xác các tọa độ theo schema DrawingIR.\n"
+    "LƯU Ý QUAN TRỌNG:\n"
+    "1. Rà soát kỹ toàn bộ các lỗ tròn (holes - ký hiệu Ø) và các rãnh phay (slots - rãnh oval bo tròn 2 đầu có đường tâm gạch-chấm-gạch hoặc ký hiệu R ở đầu rãnh).\n"
+    "2. Nếu bản vẽ không có lỗ tròn (không có ký hiệu Ø), bắt buộc để 'holes': [].\n"
+    "3. Nếu bản vẽ có rãnh phay, phải trích xuất đầy đủ tất cả các rãnh vào mảng 'slots', "
+    "lần theo từng đường dóng kích thước từ mép trái và mép đáy để xác định chính xác tọa độ tâm 2 đầu rãnh và bề rộng (chú ý: nếu ghi R ở đầu rãnh thì width = 2 * R)."
+)
+
+HOLES_PARSER_SYSTEM_PROMPT = """Bạn là một chuyên gia cao cấp về đo lường hình học và lập trình gia công cơ khí chính xác (CAD/CAM).
+Nhiệm vụ của bạn là đọc bản vẽ kỹ thuật gia công LỖ KHOAN 2D và trích xuất cấu trúc dữ liệu theo schema DrawingIR.
+
+CÁC NGUYÊN TẮC BẮT BUỘC:
+1. GỐC TỌA ĐỘ O(0,0):
+   - Mặc định nằm ở góc DƯỚI - TRÁI (Bottom-Left) của phôi chữ nhật bao ngoài.
+   - Trục X nằm ngang (X >= 0 tăng dần sang phải).
+   - Trục Y thẳng đứng (Y >= 0 tăng dần lên trên).
+   - Đơn vị tính: milimét (mm).
+
+2. TỌA ĐỘ TÂM LỖ KHOAN (HOLES):
+   - Lỗ tròn có ký hiệu tâm (+) hoặc đường tròn nét liền. Ký hiệu đường kính Ø (ví dụ Ø10) áp dụng cho các lỗ tròn cùng nhóm kích thước.
+   - Tọa độ X: Lần theo đường dóng thẳng đứng kéo xuống mép đáy (hoặc mép trên) để đọc số đo X dóng từ mép trái. Nếu kích thước dóng nối tiếp (chuỗi kích thước), tọa độ X = X_trước + khoảng_cách (ví dụ 25 + 50 = 75).
+   - Tọa độ Y: Lần theo đường dóng nằm ngang kéo sang mép trái (hoặc mép phải) để đọc số đo Y dóng từ mép đáy.
+   - Chiều sâu gia công: Mặc định cố định 5.0 mm cho mọi lỗ khoan (depth = 5.0).
+   - Đếm đủ tất cả các lỗ tròn có trên bản vẽ.
+
+3. RÃNH PHAY (SLOTS):
+   - Bản vẽ này là bản vẽ khoan lỗ, KHÔNG CÓ rãnh phay bo tròn, mảng "slots" BẮT BUỘC để rỗng: [].
+
+4. BIÊN DẠNG PHÔI (STOCK & OUTER CONTOUR):
+   - Đọc kích thước bao ngoài stock_width x stock_height (ví dụ 100x100).
+   - Chuỗi đỉnh khép kín của 4 cạnh outer_contour: [(0,0), (W,0), (W,H), (0,H), (0,0)].
+
+5. SUY LUẬN TRONG TRƯỜNG "reasoning":
+   - Trình bày súc tích: kích thước phôi, từng lỗ tròn và phép dóng kích thước X, Y, đường kính Ø, khẳng định slots=[].
+
+VÍ DỤ ĐẦU RA MẪU CHO BẢN VẼ LỖ KHOAN:
+{
+  "reasoning": "Phôi 100x100x5mm, gốc O(0,0) góc dưới-trái. Bản vẽ có 3 lỗ tròn Ø10: Lỗ 1 tại X=25, Y=75; Lỗ 2 tại X=75 (25+50), Y=50; Lỗ 3 tại X=25, Y=25. Bản vẽ không có rãnh phay nên slots=[]. 4 cạnh bao ngoài khép kín.",
+  "stock_width": 100.0,
+  "stock_height": 100.0,
+  "stock_thickness": 5.0,
   "holes": [
-    {"center": {"x": 25.0, "y": 25.0}, "diameter": 10.0, "depth": 10.0},
-    {"center": {"x": 75.0, "y": 50.0}, "diameter": 10.0, "depth": 10.0},
-    {"center": {"x": 25.0, "y": 75.0}, "diameter": 10.0, "depth": 10.0}
+    {"center": {"x": 25.0, "y": 75.0}, "diameter": 10.0, "depth": 5.0},
+    {"center": {"x": 75.0, "y": 50.0}, "diameter": 10.0, "depth": 5.0},
+    {"center": {"x": 25.0, "y": 25.0}, "diameter": 10.0, "depth": 5.0}
   ],
   "slots": [],
+  "outer_contour": [
+    {"x": 0.0, "y": 0.0},
+    {"x": 100.0, "y": 0.0},
+    {"x": 100.0, "y": 100.0},
+    {"x": 0.0, "y": 100.0},
+    {"x": 0.0, "y": 0.0}
+  ]
+}
+"""
+
+SLOTS_PARSER_SYSTEM_PROMPT = """Bạn là một chuyên gia cao cấp về đo lường hình học và lập trình gia công cơ khí chính xác (CAD/CAM).
+Nhiệm vụ của bạn là đọc bản vẽ kỹ thuật gia công RÃNH PHAY (SLOTS) 2D và trích xuất cấu trúc dữ liệu theo schema DrawingIR.
+
+CÁC NGUYÊN TẮC BẮT BUỘC:
+1. GỐC TỌA ĐỘ O(0,0):
+   - Mặc định nằm ở góc DƯỚI - TRÁI (Bottom-Left) của phôi chữ nhật bao ngoài.
+   - Trục X nằm ngang (X >= 0 tăng dần sang phải).
+   - Trục Y thẳng đứng (Y >= 0 tăng dần lên trên).
+   - Đơn vị tính: milimét (mm).
+
+2. LỖ KHOAN (HOLES):
+   - Bản vẽ này là bản vẽ phay rãnh, KHÔNG CÓ lỗ khoan Ø, mảng "holes" BẮT BUỘC để rỗng: [].
+
+3. NHẬN DIỆN VÀ TRÍCH XUẤT RÃNH PHAY (SLOTS):
+   - Rãnh phay bo tròn 2 đầu có đường tâm gạch-chấm-gạch (centerline) biểu diễn quỹ đạo chạy dao.
+   - Tọa độ tâm 2 đầu rãnh centerline_path: Lần theo đường dóng kích thước xuống mép đáy để đọc X, dóng sang mép trái/phải để đọc Y.
+   - Bề rộng rãnh width: Đọc số đo khoảng cách giữa 2 cạnh (ví dụ 12) hoặc 2 lần bán kính bo R (R10 -> width = 20.0 mm; R4 -> width = 8.0 mm).
+   - Chiều sâu gia công rãnh: Đọc từ ký hiệu t=... hoặc DP=... (mặc định 5.0 mm).
+   - Trích xuất đầy đủ tất cả các rãnh phay có trên bản vẽ.
+
+4. BIÊN DẠNG PHÔI (STOCK & OUTER CONTOUR):
+   - Đọc kích thước bao ngoài stock_width x stock_height (ví dụ 100x100).
+   - Chuỗi đỉnh khép kín của 4 cạnh outer_contour: [(0,0), (W,0), (W,H), (0,H), (0,0)].
+
+VÍ DỤ ĐẦU RA MẪU CHO BẢN VẼ RÃNH PHAY:
+{
+  "reasoning": "Phôi 100x100x5mm, gốc O(0,0) góc dưới-trái. Bản vẽ không có lỗ tròn Ø nên holes=[]. Có 3 rãnh phay: Rãnh 1 từ (10,80) đến (50,80) W=12 t=3; Rãnh 2 từ (20,16) đến (80,64) bo R10 -> W=20 t=4; Rãnh 3 từ (65,28) đến (90,10) bo R4 -> W=8 t=2. 4 cạnh bao ngoài khép kín.",
+  "stock_width": 100.0,
+  "stock_height": 100.0,
+  "stock_thickness": 5.0,
+  "holes": [],
+  "slots": [
+    {
+      "width": 12.0,
+      "centerline_path": [{"x": 10.0, "y": 80.0}, {"x": 50.0, "y": 80.0}],
+      "depth": 3.0
+    },
+    {
+      "width": 20.0,
+      "centerline_path": [{"x": 20.0, "y": 16.0}, {"x": 80.0, "y": 64.0}],
+      "depth": 4.0
+    },
+    {
+      "width": 8.0,
+      "centerline_path": [{"x": 65.0, "y": 28.0}, {"x": 90.0, "y": 10.0}],
+      "depth": 2.0
+    }
+  ],
   "outer_contour": [
     {"x": 0.0, "y": 0.0},
     {"x": 100.0, "y": 0.0},
@@ -139,6 +299,50 @@ def encode_image_base64(image_path: Union[str, Path]) -> str:
     return base64.b64encode(image_bytes).decode("utf-8")
 
 
+def post_process_drawing_ir(
+    ir: DrawingIR,
+    has_holes: bool = True,
+    has_slots: bool = True,
+) -> DrawingIR:
+    """
+    Chuẩn hóa và hoàn thiện kết quả DrawingIR sau phân tích VLM:
+    1. Lọc cứng (hard filtering): Nếu bản vẽ không có lỗ/rãnh theo kết quả phân loại,
+       cưỡng chế làm rỗng mảng tương ứng để triệt tiêu 100% ảo giác (hallucination).
+    2. Đảm bảo outer_contour luôn đầy đủ và khép kín (fallback theo stock_width x stock_height nếu thiếu).
+    3. Cố định chiều sâu gia công (depth = 5.0 mm) cho mọi lỗ và rãnh theo yêu cầu người dùng,
+       giúp người dùng và hệ thống tập trung hoàn toàn vào độ chính xác của biên dạng 2D.
+    4. Đảm bảo stock_thickness >= 5.0 mm (mặc định 5.0 mm nếu không có thông số hợp lệ).
+    """
+    if not has_holes:
+        if ir.holes:
+            logger.info(f"Hard filtering: removed {len(ir.holes)} hallucinated holes (drawing classified with no holes)")
+        ir.holes = []
+    if not has_slots:
+        if ir.slots:
+            logger.info(f"Hard filtering: removed {len(ir.slots)} hallucinated slots (drawing classified with no slots)")
+        ir.slots = []
+
+    if not ir.outer_contour or len(ir.outer_contour) < 3:
+        ir.outer_contour = ir.get_effective_outer_contour()
+    else:
+        pts = list(ir.outer_contour)
+        if abs(pts[0].x - pts[-1].x) > 1e-4 or abs(pts[0].y - pts[-1].y) > 1e-4:
+            pts.append(Point2D(x=pts[0].x, y=pts[0].y))
+        ir.outer_contour = pts
+
+    if ir.stock_thickness <= 0.0:
+        ir.stock_thickness = 5.0
+
+    # Cố định chiều sâu phay / khoan 5.0 mm cho mọi lỗ và rãnh
+    for hole in ir.holes:
+        hole.depth = 5.0
+
+    for slot in ir.slots:
+        slot.depth = 5.0
+
+    return ir
+
+
 class BaseVLMAdapter(ABC):
     """Abstract Base Class for VLM Drawing Parser Adapters."""
 
@@ -165,12 +369,15 @@ class OpenAIVLMAdapter(BaseVLMAdapter):
 
     def parse(self, image_path: Union[str, Path]) -> DrawingIR:
         """Call OpenAI VLM via instructor with structured output enforcement."""
-        import instructor
-        from openai import OpenAI
-
         if not self.api_key:
             raise ValueError(
                 "API key is missing for OpenAI VLM. Please provide api_key or set OPENAI_API_KEY environment variable."
+            )
+
+        if not HAS_OPENAI:
+            raise ImportError(
+                "OpenAI VLM dependencies ('openai', 'instructor') are not installed. "
+                "Please run 'pip install openai instructor'."
             )
 
         client_kwargs: Dict[str, Any] = {"api_key": self.api_key}
@@ -180,6 +387,7 @@ class OpenAIVLMAdapter(BaseVLMAdapter):
         client = instructor.from_openai(OpenAI(**client_kwargs))
         base64_img = encode_image_base64(image_path)
 
+        logger.info(f"Calling OpenAI VLM ({self.model}) for drawing: {image_path}")
         result: DrawingIR = client.chat.completions.create(
             model=self.model,
             response_model=DrawingIR,
@@ -190,10 +398,7 @@ class OpenAIVLMAdapter(BaseVLMAdapter):
                     "content": [
                         {
                             "type": "text",
-                            "text": (
-                                "Hãy suy luận nội bộ về mốc chuẩn và chuỗi kích thước trong trường 'reasoning' "
-                                "và trích xuất cấu trúc DrawingIR từ bản vẽ cơ khí 2D này."
-                            ),
+                            "text": PARSER_USER_PROMPT,
                         },
                         {
                             "type": "image_url",
@@ -204,9 +409,7 @@ class OpenAIVLMAdapter(BaseVLMAdapter):
             ],
             temperature=0.0,
         )
-        if not result.outer_contour:
-            result.outer_contour = result.get_effective_outer_contour()
-        return result
+        return post_process_drawing_ir(result)
 
 
 class GeminiVLMAdapter(BaseVLMAdapter):
@@ -225,13 +428,17 @@ class GeminiVLMAdapter(BaseVLMAdapter):
     def parse(self, image_path: Union[str, Path]) -> DrawingIR:
         """Call Gemini VLM via google-genai with response_schema=DrawingIR."""
         import io
-        from google import genai
-        from google.genai import types
         from PIL import Image
 
         if not self.api_key:
             raise ValueError(
                 "API key is missing for Google Gemini VLM. Please provide api_key or set GEMINI_API_KEY environment variable."
+            )
+
+        if not HAS_GEMINI:
+            raise ImportError(
+                "Google GenAI SDK ('google-genai') is not installed. "
+                "Please run 'pip install google-genai'."
             )
 
         client = genai.Client(api_key=self.api_key)
@@ -242,10 +449,7 @@ class GeminiVLMAdapter(BaseVLMAdapter):
         # Preprocess drawing image (handles transparent background and ensures high contrast)
         pil_img = Image.open(io.BytesIO(preprocess_drawing_image(img_path)))
 
-        prompt = (
-            "Hãy suy luận nội bộ về mốc chuẩn và chuỗi kích thước trong trường 'reasoning' "
-            "và trích xuất cấu trúc DrawingIR từ bản vẽ cơ khí 2D này."
-        )
+        prompt = PARSER_USER_PROMPT
 
         config = types.GenerateContentConfig(
             system_instruction=MECHANICAL_ENGINEERING_SYSTEM_PROMPT,
@@ -265,9 +469,7 @@ class GeminiVLMAdapter(BaseVLMAdapter):
             raise ValueError(f"Empty response received from Gemini model '{self.model}'.")
 
         ir = DrawingIR.model_validate_json(content)
-        if not ir.outer_contour:
-            ir.outer_contour = ir.get_effective_outer_contour()
-        return ir
+        return post_process_drawing_ir(ir)
 
 
 # Backward-compatible adapter alias for CloudVLMAdapter
@@ -307,39 +509,87 @@ class OllamaVLMAdapter(BaseVLMAdapter):
 
         return text.strip()
 
-    def parse(self, image_path: Union[str, Path]) -> DrawingIR:
-        """Send image and prompt to local Ollama server and parse JSON into DrawingIR."""
-        base64_img = encode_image_base64(image_path)
-
+    def _classify_drawing_features(self, client: httpx.Client, base64_img: str) -> Tuple[bool, bool]:
+        """
+        Phân loại nhanh đặc trưng của bản vẽ (Lỗ khoan vs Rãnh phay) để chọn prompt chuyên biệt
+        và loại bỏ triệt để hiện tượng ảo giác (hallucination) do few-shot bias trên mô hình 7B/8B.
+        """
         url = f"{self.base_url}/api/chat"
         payload = {
             "model": self.model,
             "messages": [
                 {
-                    "role": "system",
-                    "content": MECHANICAL_ENGINEERING_SYSTEM_PROMPT,
-                },
-                {
                     "role": "user",
                     "content": (
-                        "Hãy phân tích bản vẽ cơ khí 2D này. Trước tiên, hãy suy luận chi tiết "
-                        "về mốc chuẩn và chuỗi kích thước dóng trong trường 'reasoning', "
-                        "sau đó xuất chính xác các tọa độ theo schema DrawingIR."
+                        "Quan sát bản vẽ và trả lời đúng 2 dòng sau:\n"
+                        "HOLES: [CÓ hoặc KHÔNG nếu có ký hiệu Ø đường kính lỗ tròn]\n"
+                        "SLOTS: [CÓ hoặc KHÔNG nếu có ký hiệu R bán kính bo hoặc t= chiều sâu rãnh]"
                     ),
                     "images": [base64_img],
-                },
+                }
             ],
-            "format": DrawingIR.model_json_schema(),
             "stream": False,
             "options": {
                 "temperature": 0.0,
-                "num_ctx": 8192,
-                "num_predict": 4096,
+                "num_predict": 64,
             },
         }
+        try:
+            response = client.post(url, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            content = data.get("message", {}).get("content", "").upper()
+            has_holes = "HOLES: CÓ" in content or "HOLES: CO" in content
+            has_slots = "SLOTS: CÓ" in content or "SLOTS: CO" in content
+            # Nếu cả hai đều không được phát hiện rõ (hoặc trong trường hợp mock test trả về JSON chung)
+            if not has_holes and not has_slots:
+                return True, True
+            return has_holes, has_slots
+        except Exception as exc:
+            logger.warning(f"Feature pre-classification failed, falling back to all features: {exc}")
+            return True, True
+
+    def parse(self, image_path: Union[str, Path]) -> DrawingIR:
+        """Send image and prompt to local Ollama server and parse JSON into DrawingIR."""
+        base64_img = encode_image_base64(image_path)
+
+        url = f"{self.base_url}/api/chat"
 
         try:
             with httpx.Client(timeout=self.timeout) as client:
+                # Bước 1: Phân loại đặc trưng trước
+                has_holes, has_slots = self._classify_drawing_features(client, base64_img)
+
+                # Bước 2: Định tuyến prompt chuyên biệt
+                if has_holes and not has_slots:
+                    system_prompt = HOLES_PARSER_SYSTEM_PROMPT
+                elif has_slots and not has_holes:
+                    system_prompt = SLOTS_PARSER_SYSTEM_PROMPT
+                else:
+                    system_prompt = MECHANICAL_ENGINEERING_SYSTEM_PROMPT
+
+                payload = {
+                    "model": self.model,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": system_prompt,
+                        },
+                        {
+                            "role": "user",
+                            "content": PARSER_USER_PROMPT,
+                            "images": [base64_img],
+                        },
+                    ],
+                    "format": DrawingIR.model_json_schema(),
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.0,
+                        "num_ctx": 8192,
+                        "num_predict": 4096,
+                    },
+                }
+
                 response = client.post(url, json=payload)
                 response.raise_for_status()
                 data = response.json()
@@ -366,9 +616,7 @@ class OllamaVLMAdapter(BaseVLMAdapter):
             logger.error(f"Failed to validate DrawingIR from Ollama response: {cleaned_json}")
             raise ValueError(f"Ollama response failed DrawingIR schema validation:\n{val_err}") from val_err
 
-        if not ir.outer_contour:
-            ir.outer_contour = ir.get_effective_outer_contour()
-        return ir
+        return post_process_drawing_ir(ir, has_holes=has_holes, has_slots=has_slots)
 
 
 def get_vlm_adapter(

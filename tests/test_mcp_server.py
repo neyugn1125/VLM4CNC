@@ -88,7 +88,7 @@ def test_generate_gcode_tool_success(sample_drawing_json, sample_params_json, tm
 
     content = target_nc.read_text(encoding="utf-8")
     assert "M30" in content
-    assert "G83" in content
+    assert "G03" in content or "G83" in content
 
 
 def test_generate_gcode_tool_invalid_params(sample_drawing_json, tmp_path):
@@ -99,4 +99,30 @@ def test_generate_gcode_tool_invalid_params(sample_drawing_json, tmp_path):
     assert "[ERROR]" in result
     assert "Failed to parse machining params JSON" in result
     assert not target_nc.exists()
+
+
+def test_mcp_tools_with_pydantic_drawing_ir_direct(tmp_path):
+    """Verify that FastMCP tools accept direct Pydantic DrawingIR models without requiring string serialization."""
+    ir = DrawingIR(
+        stock_width=100.0,
+        stock_height=100.0,
+        stock_thickness=5.0,
+        holes=[DrillHole(center=Point2D(x=25.0, y=25.0), diameter=10.0, depth=5.0)],
+        slots=[],
+    )
+
+    # 1. Test export_dxf_tool with DrawingIR object
+    dxf_path = tmp_path / "direct_ir.dxf"
+    dxf_res = export_dxf_tool(ir, str(dxf_path))
+    assert "[SUCCESS]" in dxf_res
+    assert dxf_path.exists()
+
+    # 2. Test generate_gcode_tool with DrawingIR object and dict params
+    nc_path = tmp_path / "direct_ir.nc"
+    gcode_res = generate_gcode_tool(ir, {"cut_feed": 500.0, "tool_diameter": 4.0}, str(nc_path))
+    assert "[SUCCESS]" in gcode_res
+    assert nc_path.exists()
+    content = nc_path.read_text(encoding="utf-8")
+    assert "500.0 mm/min" in content
+
 

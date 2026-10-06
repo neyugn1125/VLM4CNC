@@ -3,7 +3,7 @@ Pydantic v2 Schemas for 2D Mechanical Drawing Analysis and Geometric Extraction.
 Defines core data models and intermediate representation (DrawingIR) for CAD/CAM operations.
 """
 
-from typing import List, Literal, Optional, Tuple
+from typing import Any, List, Literal, Optional, Tuple
 from pydantic import BaseModel, Field
 
 
@@ -21,7 +21,7 @@ class DrillHole(BaseModel):
     """Drilling hole specification."""
     center: Point2D = Field(..., description="Hole center coordinates (X, Y)")
     diameter: float = Field(..., ge=0.0, description="Hole diameter in mm")
-    depth: float = Field(..., ge=0.0, description="Drilling depth in mm")
+    depth: float = Field(default=5.0, ge=0.0, description="Drilling depth in mm (fixed at 5.0 mm)")
 
     @property
     def radius(self) -> float:
@@ -32,7 +32,7 @@ class DrillHole(BaseModel):
 class SlotContour(BaseModel):
     """Milling slot specification defined by a centerline trajectory."""
     width: float = Field(..., ge=0.0, description="Slot width in mm")
-    depth: float = Field(..., ge=0.0, description="Slot cut depth in mm")
+    depth: float = Field(default=5.0, ge=0.0, description="Slot cut depth in mm (fixed at 5.0 mm)")
     centerline_path: List[Point2D] = Field(
         ..., min_length=2, description="List of 2D points along slot centerline"
     )
@@ -46,7 +46,7 @@ class DrawingIR(BaseModel):
     )
     stock_width: float = Field(..., ge=0.0, description="Total stock plate width (X) in mm")
     stock_height: float = Field(..., ge=0.0, description="Total stock plate height (Y) in mm")
-    stock_thickness: float = Field(..., ge=0.0, description="Stock plate thickness (Z) in mm")
+    stock_thickness: float = Field(default=5.0, ge=0.0, description="Stock plate thickness (Z) in mm (default 5.0 mm)")
     holes: List[DrillHole] = Field(default_factory=list, description="List of holes to drill")
     slots: List[SlotContour] = Field(default_factory=list, description="List of slots to mill")
     outer_contour: Optional[List[Point2D]] = Field(
@@ -133,3 +133,41 @@ class PartAnalysisResult(BaseModel):
     contours: List[ContourEntity] = Field(default_factory=list, description="Extracted machining paths")
     dimensions: List[DimensionAnnotation] = Field(default_factory=list, description="Dimension callouts")
     notes: Optional[str] = Field(default=None, description="General drawing notes or machining notes")
+
+
+class MachiningParams(BaseModel):
+    """
+    Standard CAM Machining Parameters for CNC G-Code generation.
+    Supports both direct attribute access and dict-based backward compatibility.
+    """
+    tool_diameter: float = Field(default=3.0, gt=0.0, description="Đường kính dao (mm)")
+    cut_feed: float = Field(default=300.0, gt=0.0, description="Tốc độ tiến dao cắt XY (mm/min)")
+    plunge_feed: float = Field(default=100.0, gt=0.0, description="Tốc độ ăn dao trục Z (mm/min)")
+    spindle_rpm: int = Field(default=1500, gt=0, description="Tốc độ quay trục chính S (RPM)")
+    safe_z: float = Field(default=50.0, description="Cao độ lùi dao an toàn Z (mm)")
+    approach_z: float = Field(default=2.0, description="Cao độ tiếp cận / mặt phẳng R (mm)")
+    cut_depth_z: float = Field(default=-5.0, description="Chiều sâu cắt tổng thể Z (mm, thường là số âm)")
+    cut_depth_per_pass: float = Field(default=1.0, gt=0.0, description="Chiều sâu mỗi lớp cắt phay (mm)")
+    drilling_cycle: str = Field(default="G83", description="Chu trình khoan ('G81' hoặc 'G83')")
+    peck_depth: float = Field(default=2.0, gt=0.0, description="Bước ăn sâu mỗi lần ngắt phoi Q (mm)")
+    tool_number: int = Field(default=1, ge=1, description="Số thứ tự dao T")
+    tool_offset_h: int = Field(default=1, ge=1, description="Thanh ghi bù chiều dài dao H")
+    cutter_comp: str = Field(default="CAM", description="Bù bán kính dao ('CAM', 'G41', 'G40')")
+    cutter_offset_d: int = Field(default=1, ge=1, description="Thanh ghi bù bán kính dao D")
+    program_number: int = Field(default=1000, ge=1, le=9999, description="Số hiệu chương trình O")
+    mill_large_holes: bool = Field(default=True, description="Phay mở rộng lỗ tròn lớn hơn dao bằng G03")
+    mill_slot_width: bool = Field(default=True, description="Phay mở rộng rãnh theo bề rộng danh nghĩa bằng G02/Racetrack")
+    mill_outer_contour: bool = Field(default=True, description="Phay biên dạng bao ngoài chi tiết")
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """Dictionary-like get method for full backward compatibility."""
+        return getattr(self, key, default)
+
+    @property
+    def feedrate_xy(self) -> float:
+        return self.cut_feed
+
+    @property
+    def spindle_speed(self) -> int:
+        return self.spindle_rpm
+

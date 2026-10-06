@@ -21,6 +21,8 @@ from PIL import Image, ImageDraw, ImageFont
 from vision.schemas import DrawingIR, DrillHole, Point2D, SlotContour
 from vision.vlm_parser import (
     MECHANICAL_ENGINEERING_SYSTEM_PROMPT,
+    HOLES_PARSER_SYSTEM_PROMPT,
+    SLOTS_PARSER_SYSTEM_PROMPT,
     BaseVLMAdapter,
     CloudVLMAdapter,
     OpenAIVLMAdapter,
@@ -30,6 +32,7 @@ from vision.vlm_parser import (
     parse_drawing,
     encode_image_base64,
     preprocess_drawing_image,
+    post_process_drawing_ir,
 )
 
 OUTPUTS_DIR = Path(__file__).resolve().parent.parent / "outputs"
@@ -105,6 +108,42 @@ def test_system_prompt_requirements():
     assert "gạch-chấm-gạch" in MECHANICAL_ENGINEERING_SYSTEM_PROMPT
     assert "chain-of-thought" in MECHANICAL_ENGINEERING_SYSTEM_PROMPT.lower()
     assert "DrawingIR" in MECHANICAL_ENGINEERING_SYSTEM_PROMPT
+
+    # Test specialized prompts
+    assert "LỖ KHOAN" in HOLES_PARSER_SYSTEM_PROMPT
+    assert "Ø" in HOLES_PARSER_SYSTEM_PROMPT
+    assert "RÃNH PHAY" in SLOTS_PARSER_SYSTEM_PROMPT
+    assert "centerline_path" in SLOTS_PARSER_SYSTEM_PROMPT
+
+
+def test_post_process_hard_filtering():
+    """Verify post_process_drawing_ir properly enforces hard filtering for mutually exclusive features."""
+    ir = DrawingIR(
+        stock_width=100.0,
+        stock_height=100.0,
+        stock_thickness=5.0,
+        holes=[DrillHole(center=Point2D(x=25.0, y=25.0), diameter=10.0, depth=3.0)],
+        slots=[
+            SlotContour(
+                width=10.0,
+                depth=4.0,
+                centerline_path=[Point2D(x=10.0, y=10.0), Point2D(x=50.0, y=10.0)],
+            )
+        ],
+    )
+
+    # When has_holes is False, holes must be cleared
+    res_no_holes = post_process_drawing_ir(ir.model_copy(deep=True), has_holes=False, has_slots=True)
+    assert len(res_no_holes.holes) == 0
+    assert len(res_no_holes.slots) == 1
+    assert res_no_holes.slots[0].depth == 5.0  # depth fixed to 5.0 mm
+
+    # When has_slots is False, slots must be cleared
+    res_no_slots = post_process_drawing_ir(ir.model_copy(deep=True), has_holes=True, has_slots=False)
+    assert len(res_no_slots.holes) == 1
+    assert len(res_no_slots.slots) == 0
+    assert res_no_slots.holes[0].depth == 5.0  # depth fixed to 5.0 mm
+
 
 
 def test_vlm_adapter_factory():
@@ -298,6 +337,120 @@ def test_ollama_adapter_mock_inference(sample_drawing_image):
 
     print(f"\n[BENCHMARK] Local Ollama ({adapter.model}) parsed drawing in: {elapsed_ms:.2f} ms")
     print(f"[RESULT] Parsed DrawingIR:\n{result.model_dump_json(indent=2)}")
+
+
+def test_drawing_with_slots_only(sample_drawing_image):
+    """
+    Test VLM adapter parsing for a mechanical drawing containing ONLY slots (no holes),
+    verifying that slots are fully extracted and not dropped due to few-shot bias.
+    """
+    adapter = OllamaVLMAdapter()
+
+    slots_only_data = {
+        "reasoning": "Phôi 100x100mm. Không có lỗ tròn (holes=[]). Có 3 rãnh phay: rãnh ngang 12mm tại Y=80, rãnh xiên R10 (width=20) và rãnh xiên R4 (width=8).",
+        "stock_width": 100.0,
+        "stock_height": 100.0,
+        "stock_thickness": 5.0,
+        "holes": [],
+        "slots": [
+            {
+                "width": 12.0,
+                "depth": 3.0,
+                "centerline_path": [{"x": 10.0, "y": 80.0}, {"x": 50.0, "y": 80.0}],
+            },
+            {
+                "width": 20.0,
+                "depth": 4.0,
+                "centerline_path": [{"x": 20.0, "y": 16.0}, {"x": 80.0, "y": 64.0}],
+            },
+            {
+                "width": 8.0,
+                "depth": 2.0,
+                "centerline_path": [{"x": 65.0, "y": 28.0}, {"x": 90.0, "y": 10.0}],
+            },
+        ],
+        "outer_contour": [
+            {"x": 0.0, "y": 0.0},
+            {"x": 100.0, "y": 0.0},
+            {"x": 100.0, "y": 100.0},
+            {"x": 0.0, "y": 100.0},
+            {"x": 0.0, "y": 0.0},
+        ],
+    }
+
+    mock_response = {
+        "message": {
+            "role": "assistant",
+            "content": json.dumps(slots_only_data),
+        }
+    }
+
+    with patch("httpx.Client.post") as mock_post:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = mock_response
+        mock_resp.raise_for_status = MagicMock()
+        mock_post.return_value = mock_resp
+
+        result = adapter.parse(sample_drawing_image)
+
+    assert isinstance(result, DrawingIR)
+    assert len(result.holes) == 0
+    assert len(result.slots) == 3
+    assert result.slots[0].width == 12.0
+    assert result.slots[0].depth == 5.0  # normalized by post_process_drawing_ir
+    assert result.slots[1].width == 20.0
+    assert result.slots[2].width == 8.0
+    assert len(result.slots[1].centerline_path) == 2
+    assert len(result.slots[2].centerline_path) == 2
+    assert result.slots[1].centerline_path[0].x == 20.0
+    assert result.slots[1].centerline_path[0].y == 16.0
+    assert result.slots[1].centerline_path[1].x == 80.0
+    assert result.slots[1].centerline_path[1].y == 64.0
+    assert len(result.outer_contour) == 5
+
+
+def test_fixed_depth_and_contour_post_processing():
+    """Verify default 5.0mm depth on schema and post_process_drawing_ir normalization."""
+    # 1. Test schema default depth 5.0mm
+    hole = DrillHole(center=Point2D(x=20.0, y=20.0), diameter=8.0)
+    assert hole.depth == 5.0
+
+    slot = SlotContour(
+        width=6.0,
+        centerline_path=[Point2D(x=10.0, y=10.0), Point2D(x=50.0, y=10.0)],
+    )
+    assert slot.depth == 5.0
+
+    # 2. Test post_process_drawing_ir
+    raw_ir = DrawingIR(
+        stock_width=120.0,
+        stock_height=80.0,
+        stock_thickness=0.0,
+        holes=[DrillHole(center=Point2D(x=30.0, y=40.0), diameter=10.0, depth=0.0)],
+        slots=[
+            SlotContour(
+                width=10.0,
+                depth=0.0,
+                centerline_path=[Point2D(x=20.0, y=20.0), Point2D(x=80.0, y=20.0)],
+            )
+        ],
+        outer_contour=None,
+    )
+    processed = post_process_drawing_ir(raw_ir)
+
+    # Thickness and depths are normalized to 5.0mm
+    assert processed.stock_thickness == 5.0
+    assert processed.holes[0].depth == 5.0
+    assert processed.slots[0].depth == 5.0
+
+    # Outer contour is synthesized and closed
+    assert processed.outer_contour is not None
+    assert len(processed.outer_contour) == 5
+    assert processed.outer_contour[0].x == 0.0 and processed.outer_contour[0].y == 0.0
+    assert processed.outer_contour[2].x == 120.0 and processed.outer_contour[2].y == 80.0
+    assert processed.outer_contour[-1].x == processed.outer_contour[0].x
+    assert processed.outer_contour[-1].y == processed.outer_contour[0].y
 
 
 def run_standalone_benchmark():
