@@ -85,3 +85,8 @@ $RECYCLE.BIN/
 
 # General logs
 *.log
+
+# AI Agent & Assistant guidelines
+AGENTS.md
+GEMINI.md
+.gemini/
